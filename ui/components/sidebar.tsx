@@ -257,7 +257,7 @@ const SidebarItemView = ({
 			</SidebarMenuButton>
 			{hasSubItems && isExpanded && (
 				<SidebarMenuSub className="border-sidebar-border mt-1 ml-4 space-y-0.5 border-l pl-2">
-					{item.subItems?.map((subItem: SidebarItem) => {
+					{item.subItems?.filter((subItem) => subItem.hasAccess !== false).map((subItem: SidebarItem) => {
 						// For query param based subitems, check if tab matches
 						const isSubItemActive = subItem.queryParam ? pathname === subItem.url : pathname.startsWith(subItem.url);
 						const SubItemIcon = subItem.icon;
@@ -440,14 +440,16 @@ export default function AppSidebar() {
 					url: "/workspace/rbac",
 					icon: UserRoundCheck,
 					description: "User roles and permissions",
-					hasAccess: hasRbacAccess,
+					// hasAccess: hasRbacAccess,
+					hasAccess: false, // DISABLED: Enterprise feature hidden for fork
 				},
 				{
 					title: "Audit Logs",
 					url: "/workspace/audit-logs",
 					icon: ScrollText,
 					description: "Audit logs and compliance",
-					hasAccess: hasAuditLogsAccess,
+					// hasAccess: hasAuditLogsAccess,
+					hasAccess: false, // DISABLED: Enterprise feature hidden for fork
 				},
 			],
 		},
@@ -456,7 +458,8 @@ export default function AppSidebar() {
 			url: "/workspace/guardrails",
 			icon: Construction,
 			description: "Guardrails configuration",
-			hasAccess: hasGuardrailsConfigAccess || hasGuardrailsProvidersAccess,
+			// hasAccess: hasGuardrailsConfigAccess || hasGuardrailsProvidersAccess,
+			hasAccess: false, // DISABLED: Enterprise feature hidden for fork
 			subItems: [
 				{
 					title: "Configuration",
@@ -480,21 +483,24 @@ export default function AppSidebar() {
 			icon: FlaskConical,
 			isExternal: true,
 			description: "Evaluations",
-			hasAccess: true,
+			// hasAccess: true,
+			hasAccess: false, // DISABLED: Enterprise feature hidden for fork
 		},
 		{
 			title: "Cluster Config",
 			url: "/workspace/cluster",
 			icon: Layers,
 			description: "Manage Bifrost cluster",
-			hasAccess: hasClusterConfigAccess,
+			// hasAccess: hasClusterConfigAccess,
+			hasAccess: false, // DISABLED: Enterprise feature hidden for fork
 		},
 		{
 			title: "Adaptive Routing",
 			url: "/workspace/adaptive-routing",
 			icon: Shuffle,
 			description: "Manage adaptive load balancer",
-			hasAccess: isAdaptiveRoutingAllowed,
+			// hasAccess: isAdaptiveRoutingAllowed,
+			hasAccess: false, // DISABLED: Enterprise feature hidden for fork
 		},
 		{
 			title: "Config",
@@ -693,9 +699,10 @@ export default function AppSidebar() {
 				dismissible: true,
 			});
 		}
-		if (!IS_ENTERPRISE) {
-			cards.push(productionSetupHelpCard);
-		}
+		// DISABLED: Production setup promo card hidden for fork
+		// if (!IS_ENTERPRISE) {
+		// 	cards.push(productionSetupHelpCard);
+		// }
 		return cards;
 	}, [coreConfig?.restart_required, showNewReleaseBanner, latestRelease, newReleaseImage]);
 
@@ -761,7 +768,9 @@ export default function AppSidebar() {
 				<SidebarGroup className={`custom-scrollbar ${sidebarGroupHeight} overflow-scroll`}>
 					<SidebarGroupContent>
 						<SidebarMenu className="space-y-0.5">
-							{items.map((item) => {
+							{items
+								.filter((item) => item.hasAccess) // Only show items with access
+								.map((item) => {
 								const isActive = isActiveRoute(item.url);
 								const isAllowed = item.title === "Governance" ? isGovernanceEnabled : true;
 								return (
