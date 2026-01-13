@@ -294,6 +294,31 @@ type ResponsesResponseUsage struct {
 	Cost                *BifrostCost                   `json:"cost,omitempty"`        // Only for the providers which support cost calculation
 }
 
+// Normalize corrects token counts for providers where cached_tokens is independent
+// of input_tokens (not a subset). Some OpenAI-compatible providers return:
+//   - input_tokens: only new (non-cached) input tokens
+//   - cached_tokens: tokens read from cache (separate count)
+//
+// In this case, the real input_tokens should be input_tokens + cached_tokens.
+// This method detects this situation (cached > input) and corrects input/total.
+func (u *ResponsesResponseUsage) Normalize() {
+	if u == nil {
+		return
+	}
+
+	// Check and fix input tokens
+	if u.InputTokensDetails != nil && u.InputTokensDetails.CachedTokens > u.InputTokens {
+		// cached_tokens is independent, add it to input_tokens
+		u.InputTokens = u.InputTokens + u.InputTokensDetails.CachedTokens
+	}
+
+	// Recalculate total tokens
+	calculatedTotal := u.InputTokens + u.OutputTokens
+	if calculatedTotal > u.TotalTokens {
+		u.TotalTokens = calculatedTotal
+	}
+}
+
 type ResponsesResponseInputTokens struct {
 	TextTokens  int `json:"text_tokens,omitempty"`  // Tokens for text input
 	AudioTokens int `json:"audio_tokens,omitempty"` // Tokens for audio input

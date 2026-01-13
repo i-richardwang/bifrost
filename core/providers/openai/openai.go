@@ -315,6 +315,11 @@ func HandleOpenAITextCompletionRequest(
 		response.ExtraFields.RawResponse = rawResponse
 	}
 
+	// Normalize usage data for providers where cached_tokens is independent of prompt_tokens
+	if response.Usage != nil {
+		response.Usage.Normalize()
+	}
+
 	return response, nil
 }
 
@@ -614,6 +619,9 @@ func HandleOpenAITextCompletionStreaming(
 			return
 		}
 
+		// Normalize usage data for providers where cached_tokens is independent of prompt_tokens
+		usage.Normalize()
+
 		response := providerUtils.CreateBifrostTextCompletionChunkResponse(messageID, usage, finishReason, chunkIndex, schemas.TextCompletionStreamRequest, providerName, request.Model)
 		if postResponseConverter != nil {
 			response = postResponseConverter(response)
@@ -741,6 +749,11 @@ func HandleOpenAIChatCompletionRequest(
 	// Set raw response if enabled
 	if sendBackRawResponse {
 		response.ExtraFields.RawResponse = rawResponse
+	}
+
+	// Normalize usage data for providers where cached_tokens is independent of prompt_tokens
+	if response.Usage != nil {
+		response.Usage.Normalize()
 	}
 
 	return response, nil
@@ -1138,6 +1151,9 @@ func HandleOpenAIChatCompletionStreaming(
 			return
 		}
 
+		// Normalize usage data for providers where cached_tokens is independent of prompt_tokens
+		usage.Normalize()
+
 		if !isResponsesToChatCompletionsFallback {
 			response := providerUtils.CreateBifrostChatCompletionChunkResponse(messageID, usage, finishReason, chunkIndex, streamRequestType, providerName, request.Model)
 			if postResponseConverter != nil {
@@ -1262,6 +1278,11 @@ func HandleOpenAIResponsesRequest(
 	// Set raw response if enabled
 	if sendBackRawResponse {
 		response.ExtraFields.RawResponse = rawResponse
+	}
+
+	// Normalize usage data for providers where cached_tokens is independent of input_tokens
+	if response.Usage != nil {
+		response.Usage.Normalize()
 	}
 
 	return response, nil
@@ -1510,6 +1531,12 @@ func HandleOpenAIResponsesStreaming(
 					providerUtils.ParseAndSetRawRequest(&response.ExtraFields, jsonBody)
 				}
 				response.ExtraFields.Latency = time.Since(startTime).Milliseconds()
+
+				// Normalize usage data for providers where cached_tokens is independent of input_tokens
+				if response.Response != nil && response.Response.Usage != nil {
+					response.Response.Usage.Normalize()
+				}
+
 				ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
 				providerUtils.ProcessAndSendResponse(ctx, postHookRunner, providerUtils.GetBifrostResponseForStreamResponse(nil, nil, &response, nil, nil, nil), responseChan)
 				return

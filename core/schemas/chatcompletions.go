@@ -1009,6 +1009,31 @@ type BifrostLLMUsage struct {
 	Cost                    *BifrostCost                 `json:"cost,omitempty"` //Only for the providers which support cost calculation
 }
 
+// Normalize corrects token counts for providers where cached_tokens is independent
+// of prompt_tokens (not a subset). Some OpenAI-compatible providers return:
+//   - prompt_tokens: only new (non-cached) input tokens
+//   - cached_tokens: tokens read from cache (separate count)
+//
+// In this case, the real prompt_tokens should be prompt_tokens + cached_tokens.
+// This method detects this situation (cached > prompt) and corrects prompt/total.
+func (u *BifrostLLMUsage) Normalize() {
+	if u == nil {
+		return
+	}
+
+	// Check and fix prompt tokens
+	if u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens > u.PromptTokens {
+		// cached_tokens is independent, add it to prompt_tokens
+		u.PromptTokens = u.PromptTokens + u.PromptTokensDetails.CachedTokens
+	}
+
+	// Recalculate total tokens
+	calculatedTotal := u.PromptTokens + u.CompletionTokens
+	if calculatedTotal > u.TotalTokens {
+		u.TotalTokens = calculatedTotal
+	}
+}
+
 type ChatPromptTokensDetails struct {
 	TextTokens  int `json:"text_tokens,omitempty"`
 	AudioTokens int `json:"audio_tokens,omitempty"`
