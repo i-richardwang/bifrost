@@ -148,3 +148,5 @@ require (
 )
 
 replace github.com/maximhq/bifrost/core => ../core
+
+replace github.com/maximhq/bifrost/framework => ../framework
