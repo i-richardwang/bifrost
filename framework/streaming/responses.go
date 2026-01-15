@@ -931,12 +931,7 @@ func (a *Accumulator) processResponsesStreamingResponse(ctx *schemas.BifrostCont
 				if result.ResponsesStreamResponse.Response != nil {
 					data.OutputMessages = result.ResponsesStreamResponse.Response.Output
 					if result.ResponsesStreamResponse.Response.Usage != nil {
-						// Convert ResponsesResponseUsage to schemas.LLMUsage
-						data.TokenUsage = &schemas.BifrostLLMUsage{
-							PromptTokens:     result.ResponsesStreamResponse.Response.Usage.InputTokens,
-							CompletionTokens: result.ResponsesStreamResponse.Response.Usage.OutputTokens,
-							TotalTokens:      result.ResponsesStreamResponse.Response.Usage.TotalTokens,
-						}
+						data.TokenUsage = result.ResponsesStreamResponse.Response.Usage.ToBifrostLLMUsage()
 					}
 				}
 
@@ -984,11 +979,7 @@ func (a *Accumulator) processResponsesStreamingResponse(ctx *schemas.BifrostCont
 		// Extract token usage from stream response if available
 		if result.ResponsesStreamResponse.Response != nil &&
 			result.ResponsesStreamResponse.Response.Usage != nil {
-			chunk.TokenUsage = &schemas.BifrostLLMUsage{
-				PromptTokens:     result.ResponsesStreamResponse.Response.Usage.InputTokens,
-				CompletionTokens: result.ResponsesStreamResponse.Response.Usage.OutputTokens,
-				TotalTokens:      result.ResponsesStreamResponse.Response.Usage.TotalTokens,
-			}
+			chunk.TokenUsage = result.ResponsesStreamResponse.Response.Usage.ToBifrostLLMUsage()
 		}
 		chunk.ChunkIndex = result.ResponsesStreamResponse.ExtraFields.ChunkIndex
 		if isFinalChunk {
