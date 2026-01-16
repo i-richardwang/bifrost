@@ -2063,6 +2063,8 @@ func (response *AnthropicMessageResponse) ToBifrostResponsesResponse() *schemas.
 			}
 			bifrostResp.Usage.OutputTokensDetails.CachedTokens = response.Usage.CacheCreationInputTokens
 		}
+
+		bifrostResp.Usage.Normalize()
 	}
 
 	// Convert content to Responses output messages using the new conversion method

@@ -27,17 +27,9 @@ func (mc *ModelCatalog) CalculateCost(result *schemas.BifrostResponse) float64 {
 	case result.ChatResponse != nil && result.ChatResponse.Usage != nil:
 		usage = result.ChatResponse.Usage
 	case result.ResponsesResponse != nil && result.ResponsesResponse.Usage != nil:
-		usage = &schemas.BifrostLLMUsage{
-			PromptTokens:     result.ResponsesResponse.Usage.InputTokens,
-			CompletionTokens: result.ResponsesResponse.Usage.OutputTokens,
-			TotalTokens:      result.ResponsesResponse.Usage.TotalTokens,
-		}
+		usage = result.ResponsesResponse.Usage.ToBifrostLLMUsage()
 	case result.ResponsesStreamResponse != nil && result.ResponsesStreamResponse.Response != nil && result.ResponsesStreamResponse.Response.Usage != nil:
-		usage = &schemas.BifrostLLMUsage{
-			PromptTokens:     result.ResponsesStreamResponse.Response.Usage.InputTokens,
-			CompletionTokens: result.ResponsesStreamResponse.Response.Usage.OutputTokens,
-			TotalTokens:      result.ResponsesStreamResponse.Response.Usage.TotalTokens,
-		}
+		usage = result.ResponsesStreamResponse.Response.Usage.ToBifrostLLMUsage()
 	case result.EmbeddingResponse != nil && result.EmbeddingResponse.Usage != nil:
 		usage = result.EmbeddingResponse.Usage
 	case result.SpeechResponse != nil:

@@ -470,6 +470,7 @@ func (response *AnthropicMessageResponse) ToBifrostChatResponse() *schemas.Bifro
 			},
 			TotalTokens: response.Usage.InputTokens + response.Usage.OutputTokens,
 		}
+		bifrostResponse.Usage.Normalize()
 	}
 
 	return bifrostResponse

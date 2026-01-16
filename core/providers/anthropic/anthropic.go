@@ -679,6 +679,10 @@ func HandleAnthropicChatCompletionStreaming(
 			providerUtils.ProcessAndSendError(ctx, postHookRunner, err, responseChan, schemas.ChatCompletionStreamRequest, providerName, modelName, logger)
 			return
 		}
+
+		// Normalize usage data for providers where cached_tokens is independent of prompt_tokens
+		usage.Normalize()
+
 		response := providerUtils.CreateBifrostChatCompletionChunkResponse(messageID, usage, finishReason, chunkIndex, schemas.ChatCompletionStreamRequest, providerName, modelName)
 		if postResponseConverter != nil {
 			response = postResponseConverter(response)
@@ -1032,6 +1036,10 @@ func HandleAnthropicResponsesStream(
 						if response.Response == nil {
 							response.Response = &schemas.BifrostResponsesResponse{}
 						}
+
+						// Normalize usage data for providers where cached_tokens is independent of input_tokens
+						usage.Normalize()
+
 						response.Response.Usage = usage
 						// Set raw request if enabled
 						if sendBackRawRequest {
