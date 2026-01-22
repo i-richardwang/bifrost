@@ -10,8 +10,8 @@ require (
 	github.com/google/pprof v0.0.0-20251213031049-b05bdaca462f
 	github.com/google/uuid v1.6.0
 	github.com/mark3labs/mcp-go v0.43.2
-	github.com/maximhq/bifrost/core v1.3.11
-	github.com/maximhq/bifrost/framework v1.2.12
+	github.com/maximhq/bifrost/core v1.3.12
+	github.com/maximhq/bifrost/framework v1.2.13
 	github.com/maximhq/bifrost/plugins/governance v1.4.13
 	github.com/maximhq/bifrost/plugins/litellmcompat v0.0.2
 	github.com/maximhq/bifrost/plugins/logging v1.4.12
@@ -27,6 +27,7 @@ require (
 )
 
 require (
+	cloud.google.com/go v0.123.0 // indirect
 	cloud.google.com/go/compute/metadata v0.9.0 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.20.0 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.13.1 // indirect
@@ -151,3 +152,19 @@ require (
 replace github.com/maximhq/bifrost/core => ../core
 
 replace github.com/maximhq/bifrost/framework => ../framework
+
+replace github.com/maximhq/bifrost/plugins/governance => ../plugins/governance
+
+replace github.com/maximhq/bifrost/plugins/litellmcompat => ../plugins/litellmcompat
+
+replace github.com/maximhq/bifrost/plugins/logging => ../plugins/logging
+
+replace github.com/maximhq/bifrost/plugins/maxim => ../plugins/maxim
+
+replace github.com/maximhq/bifrost/plugins/mocker => ../plugins/mocker
+
+replace github.com/maximhq/bifrost/plugins/otel => ../plugins/otel
+
+replace github.com/maximhq/bifrost/plugins/semanticcache => ../plugins/semanticcache
+
+replace github.com/maximhq/bifrost/plugins/telemetry => ../plugins/telemetry
