@@ -430,14 +430,22 @@ func convertToolMessages(msgs []schemas.ChatMessage) (BedrockMessage, error) {
 				})
 			} else {
 				// Use the parsed JSON object
-				// Bedrock does not consider a json array valid for this field, so we wrap it first.
-				if _, isArray := parsedOutput.([]any); isArray {
+				// Bedrock does not accept primitives or arrays directly in the json field
+				switch v := parsedOutput.(type) {
+				case map[string]any:
+					// Objects are valid as-is
 					toolResultContent = append(toolResultContent, BedrockContentBlock{
-						JSON: map[string]any{"results": parsedOutput},
+						JSON: v,
 					})
-				} else {
+				case []any:
+					// Arrays need to be wrapped
 					toolResultContent = append(toolResultContent, BedrockContentBlock{
-						JSON: parsedOutput,
+						JSON: map[string]any{"results": v},
+					})
+				default:
+					// Primitives (string, number, boolean, null) need to be wrapped
+					toolResultContent = append(toolResultContent, BedrockContentBlock{
+						JSON: map[string]any{"value": v},
 					})
 				}
 			}
@@ -507,7 +515,6 @@ func convertToolMessages(msgs []schemas.ChatMessage) (BedrockMessage, error) {
 // convertContent converts Bifrost message content to Bedrock content blocks
 func convertContent(content schemas.ChatMessageContent) ([]BedrockContentBlock, error) {
 	var contentBlocks []BedrockContentBlock
-
 	if content.ContentStr != nil {
 		// Simple text content
 		contentBlocks = append(contentBlocks, BedrockContentBlock{
@@ -531,6 +538,9 @@ func convertContent(content schemas.ChatMessageContent) ([]BedrockContentBlock, 
 func convertContentBlock(block schemas.ChatContentBlock) ([]BedrockContentBlock, error) {
 	switch block.Type {
 	case schemas.ChatContentBlockTypeText:
+		if block.Text == nil {
+			return []BedrockContentBlock{}, nil
+		}
 		blocks := []BedrockContentBlock{
 			{
 				Text: block.Text,
@@ -682,6 +692,7 @@ func convertImageToBedrockSource(imageURL string) (*BedrockImageSource, error) {
 
 // convertResponseFormatToTool converts a response_format parameter to a Bedrock tool
 // Returns nil if no response_format is present or if it's not a json_schema type
+// Ref: https://aws.amazon.com/blogs/machine-learning/structured-data-response-with-amazon-bedrock-prompt-engineering-and-tool-use/
 func convertResponseFormatToTool(ctx *schemas.BifrostContext, params *schemas.ChatParameters) *BedrockTool {
 	if params == nil || params.ResponseFormat == nil {
 		return nil

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/textproto"
 	"net/url"
@@ -78,8 +79,26 @@ func MakeRequestWithContext(ctx context.Context, client *fasthttp.Client, req *f
 					},
 				}
 			}
+			// Check for timeout errors first before checking net.OpError to avoid misclassification
 			if errors.Is(err, fasthttp.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
 				return latency, NewBifrostOperationError(schemas.ErrProviderRequestTimedOut, err, "")
+			}
+			// Check if error implements net.Error and has Timeout() == true
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				return latency, NewBifrostOperationError(schemas.ErrProviderRequestTimedOut, err, "")
+			}
+			// Check for DNS lookup and network errors after timeout checks
+			var opErr *net.OpError
+			var dnsErr *net.DNSError
+			if errors.As(err, &opErr) || errors.As(err, &dnsErr) {
+				return latency, &schemas.BifrostError{
+					IsBifrostError: false,
+					Error: &schemas.ErrorField{
+						Message: schemas.ErrProviderNetworkError,
+						Error:   err,
+					},
+				}
 			}
 			// The HTTP request itself failed (e.g., connection error, fasthttp timeout).
 			return latency, &schemas.BifrostError{
@@ -217,16 +236,11 @@ func filterHeaders(headers map[string][]string) map[string][]string {
 // SetExtraHeaders sets additional headers from NetworkConfig to the fasthttp request.
 // This allows users to configure custom headers for their provider requests.
 // Header keys are canonicalized using textproto.CanonicalMIMEHeaderKey to avoid duplicates.
-// The Authorization header is excluded for security reasons.
 // It accepts a list of headers (all canonicalized) to skip for security reasons.
 // Headers are only set if they don't already exist on the request to avoid overwriting important headers.
 func SetExtraHeaders(ctx context.Context, req *fasthttp.Request, extraHeaders map[string]string, skipHeaders []string) {
 	for key, value := range extraHeaders {
 		canonicalKey := textproto.CanonicalMIMEHeaderKey(key)
-		// Skip Authorization header for security reasons
-		if key == "Authorization" {
-			continue
-		}
 		if skipHeaders != nil {
 			if slices.Contains(skipHeaders, key) {
 				continue
@@ -326,10 +340,6 @@ func CheckContextAndGetRequestBody(ctx context.Context, request RequestBodyGette
 func SetExtraHeadersHTTP(ctx context.Context, req *http.Request, extraHeaders map[string]string, skipHeaders []string) {
 	for key, value := range extraHeaders {
 		canonicalKey := textproto.CanonicalMIMEHeaderKey(key)
-		// Skip Authorization header for security reasons
-		if key == "Authorization" {
-			continue
-		}
 		if skipHeaders != nil {
 			if slices.Contains(skipHeaders, key) {
 				continue
@@ -392,10 +402,8 @@ func HandleProviderAPIError(resp *fasthttp.Response, errorResp any) *schemas.Bif
 	// Try to unmarshal decoded body for RawResponse
 	var rawErrorResponse interface{}
 	if err := sonic.Unmarshal(decodedBody, &rawErrorResponse); err != nil {
-		if logger != nil {
-			logger.Warn(fmt.Sprintf("Failed to parse raw error response: %v", err))
-		}
-		// If unmarshal fails (e.g., for HTML or plain text), store as string so RawResponse is never nil
+		// Store raw body as string for RawResponse when JSON parsing fails
+		// Continue to HTML detection and proper error handling below
 		rawErrorResponse = string(decodedBody)
 	}
 
@@ -1700,4 +1708,29 @@ func completeDeferredSpan(ctx *schemas.BifrostContext, result *schemas.BifrostRe
 
 	// Clear the deferred span from TraceStore
 	tracer.ClearDeferredSpan(traceID)
+}
+
+// CheckAndSetDefaultProvider checks if the default provider should be used based on the context.
+// It returns the default provider if it should be used, otherwise it returns an empty string.
+// Checks if the direct key is set in the context, or if key selection is skipped.
+// Or if the available providers are set in the context and the default provider is in the list.
+func CheckAndSetDefaultProvider(ctx *schemas.BifrostContext, defaultProvider schemas.ModelProvider) schemas.ModelProvider {
+	if ctx != nil {
+		if ctx.Value(schemas.BifrostContextKeyDirectKey) != nil || ctx.Value(schemas.BifrostContextKeySkipKeySelection) != nil {
+			return defaultProvider
+		}
+		if ctx.Value(schemas.BifrostContextKeyAvailableProviders) != nil {
+			availableProviders, ok := ctx.Value(schemas.BifrostContextKeyAvailableProviders).([]schemas.ModelProvider)
+			if !ok || len(availableProviders) == 0 {
+				return ""
+			}
+			logger.Debug("[Provider] Available providers: %v, checking %s", availableProviders, defaultProvider)
+			if slices.Contains(availableProviders, defaultProvider) {
+				return defaultProvider
+			}
+			return ""
+		}
+		return defaultProvider
+	}
+	return defaultProvider
 }

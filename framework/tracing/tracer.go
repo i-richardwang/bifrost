@@ -15,16 +15,19 @@ import (
 // framework's TraceStore implementation.
 // It also embeds a streaming.Accumulator for centralized streaming chunk accumulation.
 type Tracer struct {
-	store       *TraceStore
-	accumulator *streaming.Accumulator
+	store          *TraceStore
+	accumulator    *streaming.Accumulator
+	pricingManager *modelcatalog.ModelCatalog
 }
 
 // NewTracer creates a new Tracer wrapping the given TraceStore.
 // The accumulator is embedded for centralized streaming chunk accumulation.
+// The pricingManager is used for cost calculation in span attributes.
 func NewTracer(store *TraceStore, pricingManager *modelcatalog.ModelCatalog, logger schemas.Logger) *Tracer {
 	return &Tracer{
-		store:       store,
-		accumulator: streaming.NewAccumulator(pricingManager, logger),
+		store:          store,
+		accumulator:    streaming.NewAccumulator(pricingManager, logger),
+		pricingManager: pricingManager,
 	}
 }
 
@@ -179,6 +182,11 @@ func (t *Tracer) PopulateLLMResponseAttributes(handle schemas.SpanHandle, resp *
 	}
 	for k, v := range PopulateErrorAttributes(err) {
 		span.SetAttribute(k, v)
+	}
+	// Populate cost attribute using pricing manager
+	if t.pricingManager != nil && resp != nil {
+		cost := t.pricingManager.CalculateCostWithCacheDebug(resp)
+		span.SetAttribute(schemas.AttrUsageCost, cost)
 	}
 }
 
@@ -499,15 +507,15 @@ func (t *Tracer) CleanupStreamAccumulator(traceID string) {
 // Returns the accumulated result. IsFinal will be true when the stream is complete.
 // This method is used by plugins to access accumulated streaming data.
 // The ctx parameter must contain the stream end indicator for proper final chunk detection.
-func (t *Tracer) ProcessStreamingChunk(ctx *schemas.BifrostContext, traceID string, result *schemas.BifrostResponse, err *schemas.BifrostError) *schemas.StreamAccumulatorResult {
-	if traceID == "" || t.accumulator == nil || ctx == nil {
+func (t *Tracer) ProcessStreamingChunk(traceID string, isFinalChunk bool, result *schemas.BifrostResponse, err *schemas.BifrostError) *schemas.StreamAccumulatorResult {
+	if traceID == "" || t.accumulator == nil {
 		return nil
 	}
 
 	// Create a new context for accumulator that sets the traceID as the accumulator lookup ID.
-	// This inherits from the original context (preserves stream end indicator).
-	accumCtx := schemas.NewBifrostContext(ctx, time.Time{})
+	accumCtx := schemas.NewBifrostContext(context.Background(), time.Time{})
 	accumCtx.SetValue(schemas.BifrostContextKeyAccumulatorID, traceID)
+	accumCtx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, isFinalChunk)
 
 	processedResp, processErr := t.accumulator.ProcessStreamingResponse(accumCtx, result, err)
 	if processErr != nil || processedResp == nil {
@@ -535,6 +543,10 @@ func (t *Tracer) ProcessStreamingChunk(ctx *schemas.BifrostContext, traceID stri
 		accResult.ImageGenerationOutput = processedResp.Data.ImageGenerationOutput
 		accResult.FinishReason = processedResp.Data.FinishReason
 		accResult.RawResponse = processedResp.Data.RawResponse
+
+		if (accResult.Cost == nil || *accResult.Cost == 0.0) && accResult.TokenUsage != nil && accResult.TokenUsage.Cost != nil {
+			accResult.Cost = &accResult.TokenUsage.Cost.TotalCost
+		}
 	}
 
 	if processedResp.RawRequest != nil {

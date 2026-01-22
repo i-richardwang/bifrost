@@ -6,6 +6,7 @@ import {
 	Boxes,
 	BoxIcon,
 	BugIcon,
+	ChartColumnBig,
 	ChevronsLeftRightEllipsis,
 	CircleDollarSign,
 	Cog,
@@ -221,13 +222,12 @@ const SidebarItemView = ({
 		<SidebarMenuItem key={item.title}>
 			<SidebarMenuButton
 				tooltip={item.title}
-				className={`relative h-7.5 cursor-pointer rounded-sm border px-3 transition-all duration-200 ${
-					isActive || isAnySubItemActive
+				className={`relative h-7.5 cursor-pointer rounded-sm border px-3 transition-all duration-200 ${isActive || isAnySubItemActive
 						? "bg-sidebar-accent text-primary border-primary/20"
 						: isAllowed && item.hasAccess
 							? "hover:bg-sidebar-accent hover:text-accent-foreground border-transparent text-slate-500 dark:text-zinc-400"
 							: "hover:bg-destructive/5 hover:text-muted-foreground text-muted-foreground cursor-not-allowed border-transparent"
-				} `}
+					} `}
 				onClick={hasSubItems ? handleClick : () => handleNavigation(item.url)}
 			>
 				<div className="flex w-full items-center justify-between">
@@ -264,13 +264,12 @@ const SidebarItemView = ({
 						return (
 							<SidebarMenuSubItem key={subItem.title}>
 								<SidebarMenuSubButton
-									className={`h-7 cursor-pointer rounded-sm px-2 transition-all duration-200 ${
-										isSubItemActive
+									className={`h-7 cursor-pointer rounded-sm px-2 transition-all duration-200 ${isSubItemActive
 											? "bg-sidebar-accent text-primary font-medium"
 											: subItem.hasAccess === false
 												? "hover:bg-destructive/5 hover:text-muted-foreground text-muted-foreground cursor-not-allowed border-transparent"
 												: "hover:bg-sidebar-accent hover:text-accent-foreground text-slate-500 dark:text-zinc-400"
-									}`}
+										}`}
 									onClick={() => (subItem.hasAccess === false ? undefined : handleSubItemClick(subItem))}
 								>
 									<div className="flex items-center gap-2">
@@ -348,6 +347,7 @@ export default function AppSidebar() {
 	const hasTeamsAccess = useRbac(RbacResource.Teams, RbacOperation.View);
 	const hasRbacAccess = useRbac(RbacResource.RBAC, RbacOperation.View);
 	const hasVirtualKeysAccess = useRbac(RbacResource.VirtualKeys, RbacOperation.View);
+	const hasGovernanceAccess = useRbac(RbacResource.Governance, RbacOperation.View);
 	const hasGuardrailsProvidersAccess = useRbac(RbacResource.GuardrailsProviders, RbacOperation.View);
 	const hasGuardrailsConfigAccess = useRbac(RbacResource.GuardrailsConfig, RbacOperation.View);
 	const hasClusterConfigAccess = useRbac(RbacResource.Cluster, RbacOperation.View);
@@ -362,6 +362,13 @@ export default function AppSidebar() {
 			description: "Request logs & monitoring",
 			hasAccess: hasLogsAccess,
 			subItems: [
+				{
+					title: "Dashboard",
+					url: "/workspace/dashboard",
+					icon: ChartColumnBig,
+					description: "Dashboard",
+					hasAccess: hasObservabilityAccess,
+				},
 				{
 					title: "Logs",
 					url: "/workspace/logs",
@@ -412,7 +419,8 @@ export default function AppSidebar() {
 			url: "/workspace/governance",
 			icon: Landmark,
 			description: "Govern access",
-			hasAccess: hasVirtualKeysAccess || hasCustomersAccess || hasTeamsAccess || hasUserProvisioningAccess || hasRbacAccess,
+			hasAccess:
+				hasVirtualKeysAccess || hasGovernanceAccess || hasCustomersAccess || hasTeamsAccess || hasUserProvisioningAccess || hasRbacAccess,
 			subItems: [
 				{
 					title: "Virtual Keys",
@@ -420,6 +428,13 @@ export default function AppSidebar() {
 					icon: KeyRound,
 					description: "Manage virtual keys & access",
 					hasAccess: hasVirtualKeysAccess,
+				},
+				{
+					title: "Model Limits",
+					url: "/workspace/model-limits",
+					icon: Gauge,
+					description: "Model-level budgets & rate limits",
+					hasAccess: hasGovernanceAccess,
 				},
 				{
 					title: "Users & Groups",
@@ -567,14 +582,14 @@ export default function AppSidebar() {
 				},
 				...(IS_ENTERPRISE
 					? [
-							{
-								title: "Proxy",
-								url: "/workspace/config/proxy",
-								icon: Globe,
-								description: "Proxy configuration",
-								hasAccess: hasSettingsAccess,
-							},
-						]
+						{
+							title: "Proxy",
+							url: "/workspace/config/proxy",
+							icon: Globe,
+							description: "Proxy configuration",
+							hasAccess: hasSettingsAccess,
+						},
+					]
 					: []),
 				{
 					title: "API Keys",

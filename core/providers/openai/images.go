@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"github.com/maximhq/bifrost/core/providers/utils"
 	"github.com/maximhq/bifrost/core/schemas"
 )
 
@@ -22,6 +23,8 @@ func ToOpenAIImageGenerationRequest(bifrostReq *schemas.BifrostImageGenerationRe
 	switch bifrostReq.Provider {
 	case schemas.XAI:
 		filterXAISpecificParameters(req)
+	case schemas.OpenAI, schemas.Azure:
+		filterOpenAISpecificParameters(req)
 	}
 	return req
 }
@@ -33,13 +36,19 @@ func filterXAISpecificParameters(req *OpenAIImageGenerationRequest) {
 	req.ImageGenerationParameters.OutputCompression = nil
 }
 
+func filterOpenAISpecificParameters(req *OpenAIImageGenerationRequest) {
+	req.ImageGenerationParameters.Seed = nil
+	req.NumInferenceSteps = nil
+	req.NegativePrompt = nil
+}
+
 // ToBifrostImageGenerationRequest converts an OpenAI image generation request to Bifrost format
-func (request *OpenAIImageGenerationRequest) ToBifrostImageGenerationRequest() *schemas.BifrostImageGenerationRequest {
+func (request *OpenAIImageGenerationRequest) ToBifrostImageGenerationRequest(ctx *schemas.BifrostContext) *schemas.BifrostImageGenerationRequest {
 	if request == nil {
 		return nil
 	}
 
-	provider, model := schemas.ParseModelString(request.Model, schemas.OpenAI)
+	provider, model := schemas.ParseModelString(request.Model, utils.CheckAndSetDefaultProvider(ctx, schemas.OpenAI))
 
 	// Only set Params if the embedded struct is non-empty to avoid always emitting empty params
 	var params *schemas.ImageGenerationParameters

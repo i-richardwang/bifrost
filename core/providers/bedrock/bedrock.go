@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -92,7 +93,7 @@ func (provider *BedrockProvider) completeRequest(ctx *schemas.BifrostContext, js
 	config := key.BedrockKeyConfig
 
 	region := DefaultBedrockRegion
-	if config.Region != nil  && config.Region.GetValue() != "" {
+	if config.Region != nil && config.Region.GetValue() != "" {
 		region = config.Region.GetValue()
 	}
 
@@ -136,8 +137,25 @@ func (provider *BedrockProvider) completeRequest(ctx *schemas.BifrostContext, js
 				},
 			}
 		}
+		// Check for timeout first using net.Error before checking net.OpError
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return nil, latency, providerUtils.NewBifrostOperationError(schemas.ErrProviderRequestTimedOut, err, provider.GetProviderKey())
+		}
 		if errors.Is(err, http.ErrHandlerTimeout) || errors.Is(err, context.DeadlineExceeded) {
 			return nil, latency, providerUtils.NewBifrostOperationError(schemas.ErrProviderRequestTimedOut, err, provider.GetProviderKey())
+		}
+		// Check for DNS lookup and network errors after timeout checks
+		var opErr *net.OpError
+		var dnsErr *net.DNSError
+		if errors.As(err, &opErr) || errors.As(err, &dnsErr) {
+			return nil, latency, &schemas.BifrostError{
+				IsBifrostError: false,
+				Error: &schemas.ErrorField{
+					Message: schemas.ErrProviderNetworkError,
+					Error:   err,
+				},
+			}
 		}
 		return nil, latency, &schemas.BifrostError{
 			IsBifrostError: false,
@@ -248,6 +266,20 @@ func (provider *BedrockProvider) makeStreamingRequest(ctx *schemas.BifrostContex
 					Error:   respErr,
 				},
 			}
+		}
+		// Check for timeout first using net.Error before checking net.OpError
+		var netErr net.Error
+		if errors.As(respErr, &netErr) && netErr.Timeout() {
+			return nil, deployment, providerUtils.NewBifrostOperationError(schemas.ErrProviderRequestTimedOut, respErr, providerName)
+		}
+		if errors.Is(respErr, http.ErrHandlerTimeout) || errors.Is(respErr, context.DeadlineExceeded) {
+			return nil, deployment, providerUtils.NewBifrostOperationError(schemas.ErrProviderRequestTimedOut, respErr, providerName)
+		}
+		// Check for DNS lookup and network errors after timeout checks
+		var opErr *net.OpError
+		var dnsErr *net.DNSError
+		if errors.As(respErr, &opErr) || errors.As(respErr, &dnsErr) {
+			return nil, deployment, providerUtils.NewBifrostOperationError(schemas.ErrProviderNetworkError, respErr, providerName)
 		}
 		return nil, deployment, providerUtils.NewBifrostOperationError(schemas.ErrProviderDoRequest, respErr, providerName)
 	}
@@ -419,8 +451,26 @@ func (provider *BedrockProvider) listModelsByKey(ctx *schemas.BifrostContext, ke
 					Error:   err,
 				},
 			}
-		} else if errors.Is(err, http.ErrHandlerTimeout) || errors.Is(err, context.DeadlineExceeded) {
+		}
+		// Check for timeout first using net.Error before checking net.OpError
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
 			return nil, providerUtils.NewBifrostOperationError(schemas.ErrProviderRequestTimedOut, err, providerName)
+		}
+		if errors.Is(err, http.ErrHandlerTimeout) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, providerUtils.NewBifrostOperationError(schemas.ErrProviderRequestTimedOut, err, providerName)
+		}
+		// Check for DNS lookup and network errors after timeout checks
+		var opErr *net.OpError
+		var dnsErr *net.DNSError
+		if errors.As(err, &opErr) || errors.As(err, &dnsErr) {
+			return nil, &schemas.BifrostError{
+				IsBifrostError: false,
+				Error: &schemas.ErrorField{
+					Message: schemas.ErrProviderNetworkError,
+					Error:   err,
+				},
+			}
 		}
 		return nil, &schemas.BifrostError{
 			IsBifrostError: false,
@@ -756,6 +806,16 @@ func (provider *BedrockProvider) ChatCompletion(ctx *schemas.BifrostContext, key
 		return nil, providerUtils.EnrichError(ctx, providerUtils.NewBifrostOperationError("failed to convert bedrock response", err, providerName), jsonData, responseBody, provider.sendBackRawRequest, provider.sendBackRawResponse)
 	}
 
+	// Override finish reason for structured output
+	// When structured output is used, tool_use is expected but should appear as "stop" to the client
+	if _, ok := ctx.Value(schemas.BifrostContextKeyStructuredOutputToolName).(string); ok {
+		if len(bifrostResponse.Choices) > 0 && bifrostResponse.Choices[0].FinishReason != nil {
+			if *bifrostResponse.Choices[0].FinishReason == string(schemas.BifrostFinishReasonToolCalls) {
+				bifrostResponse.Choices[0].FinishReason = schemas.Ptr(string(schemas.BifrostFinishReasonStop))
+			}
+		}
+	}
+
 	// Set ExtraFields
 	bifrostResponse.ExtraFields.Provider = providerName
 	bifrostResponse.ExtraFields.ModelRequested = request.Model
@@ -834,6 +894,15 @@ func (provider *BedrockProvider) ChatCompletionStream(ctx *schemas.BifrostContex
 
 		// Bedrock does not provide a unique identifier for the stream, so we generate one ourselves
 		id := uuid.New().String()
+
+		// Check for structured output mode - if set, we need to intercept tool calls
+		// and convert them to content instead of forwarding as tool calls
+		var structuredOutputToolName string
+		if toolName, ok := ctx.Value(schemas.BifrostContextKeyStructuredOutputToolName).(string); ok {
+			structuredOutputToolName = toolName
+		}
+		var structuredOutputBuilder strings.Builder
+		var isAccumulatingStructuredOutput bool
 
 		for {
 			// If context was cancelled/timed out, let defer handle it
@@ -915,6 +984,66 @@ func (provider *BedrockProvider) ChatCompletionStream(ctx *schemas.BifrostContex
 
 				if streamEvent.StopReason != nil {
 					finishReason = schemas.Ptr(anthropic.ConvertAnthropicFinishReasonToBifrost(anthropic.AnthropicStopReason(*streamEvent.StopReason)))
+
+					// Override finish reason for structured output
+					// When structured output is used, tool_use stop reason should appear as "stop" to the client
+					if structuredOutputToolName != "" && *finishReason == string(schemas.BifrostFinishReasonToolCalls) {
+						finishReason = schemas.Ptr(string(schemas.BifrostFinishReasonStop))
+					}
+				}
+
+				// Handle structured output: intercept tool calls for the structured output tool
+				// and convert them to content instead of forwarding as tool calls
+				if structuredOutputToolName != "" {
+					// Check for tool use start event
+					if streamEvent.Start != nil && streamEvent.Start.ToolUse != nil {
+						if streamEvent.Start.ToolUse.Name == structuredOutputToolName {
+							// This is the structured output tool - start accumulating, don't forward
+							isAccumulatingStructuredOutput = true
+							continue
+						}
+					}
+
+					// Check for tool use delta event
+					if streamEvent.Delta != nil && streamEvent.Delta.ToolUse != nil && isAccumulatingStructuredOutput {
+						// Accumulate the input for tracking purposes
+						structuredOutputBuilder.WriteString(streamEvent.Delta.ToolUse.Input)
+
+						// Convert tool use delta to content delta
+						content := streamEvent.Delta.ToolUse.Input
+						response := &schemas.BifrostChatResponse{
+							ID:     id,
+							Model:  request.Model,
+							Object: "chat.completion.chunk",
+							Choices: []schemas.BifrostResponseChoice{
+								{
+									Index: 0,
+									ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{
+										Delta: &schemas.ChatStreamResponseChoiceDelta{
+											Content: &content,
+										},
+									},
+								},
+							},
+							ExtraFields: schemas.BifrostResponseExtraFields{
+								RequestType:     schemas.ChatCompletionStreamRequest,
+								Provider:        providerName,
+								ModelRequested:  request.Model,
+								ModelDeployment: deployment,
+								ChunkIndex:      chunkIndex,
+								Latency:         time.Since(lastChunkTime).Milliseconds(),
+							},
+						}
+						chunkIndex++
+						lastChunkTime = time.Now()
+
+						if providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse) {
+							response.ExtraFields.RawResponse = string(message.Payload)
+						}
+
+						providerUtils.ProcessAndSendResponse(ctx, postHookRunner, providerUtils.GetBifrostResponseForStreamResponse(nil, response, nil, nil, nil, nil), responseChan)
+						continue
+					}
 				}
 
 				response, bifrostErr, _ := streamEvent.ToBifrostChatCompletionStream()
@@ -1091,6 +1220,14 @@ func (provider *BedrockProvider) ResponsesStream(ctx *schemas.BifrostContext, po
 		streamState.Model = &deployment
 		defer releaseBedrockResponsesStreamState(streamState)
 
+		// Check for structured output mode - if set, we need to intercept tool calls
+		// and convert them to content instead of forwarding as tool calls
+		var structuredOutputToolName string
+		if toolName, ok := ctx.Value(schemas.BifrostContextKeyStructuredOutputToolName).(string); ok {
+			structuredOutputToolName = toolName
+		}
+		var isAccumulatingStructuredOutput bool
+
 		// Process AWS Event Stream format using proper decoder
 		startTime := time.Now()
 		lastChunkTime := startTime
@@ -1202,6 +1339,48 @@ func (provider *BedrockProvider) ResponsesStream(ctx *schemas.BifrostContext, po
 						}
 					}
 				}
+
+				// Handle structured output: intercept tool calls for the structured output tool
+				// and convert them to content instead of forwarding as tool calls
+				if structuredOutputToolName != "" {
+					// Check for tool use start event
+					if streamEvent.Start != nil && streamEvent.Start.ToolUse != nil {
+						if streamEvent.Start.ToolUse.Name == structuredOutputToolName {
+							// This is the structured output tool - start accumulating, don't forward
+							isAccumulatingStructuredOutput = true
+							continue
+						}
+					}
+
+					// Check for tool use delta event
+					if streamEvent.Delta != nil && streamEvent.Delta.ToolUse != nil && isAccumulatingStructuredOutput {
+						// Convert tool use delta to text delta
+						content := streamEvent.Delta.ToolUse.Input
+						response := &schemas.BifrostResponsesStreamResponse{
+							Type:           schemas.ResponsesStreamResponseTypeOutputTextDelta,
+							SequenceNumber: chunkIndex,
+							Delta:          &content,
+							ExtraFields: schemas.BifrostResponseExtraFields{
+								RequestType:     schemas.ResponsesStreamRequest,
+								Provider:        providerName,
+								ModelRequested:  request.Model,
+								ModelDeployment: deployment,
+								ChunkIndex:      chunkIndex,
+								Latency:         time.Since(lastChunkTime).Milliseconds(),
+							},
+						}
+						chunkIndex++
+						lastChunkTime = time.Now()
+
+						if providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse) {
+							response.ExtraFields.RawResponse = string(message.Payload)
+						}
+
+						providerUtils.ProcessAndSendResponse(ctx, postHookRunner, providerUtils.GetBifrostResponseForStreamResponse(nil, nil, response, nil, nil, nil), responseChan)
+						continue
+					}
+				}
+
 				responses, bifrostErr, _ := streamEvent.ToBifrostResponsesStream(chunkIndex, streamState)
 				if bifrostErr != nil {
 					bifrostErr.ExtraFields = schemas.BifrostErrorExtraFields{
@@ -1357,9 +1536,82 @@ func (provider *BedrockProvider) TranscriptionStream(ctx *schemas.BifrostContext
 	return nil, providerUtils.NewUnsupportedOperationError(schemas.TranscriptionStreamRequest, schemas.Bedrock)
 }
 
-// ImageGeneration is not supported by the Bedrock provider.
+// ImageGeneration generates images using Amazon Bedrock.
+// Supports Titan Image Generator v1, Nova Canvas v1, and Titan Image Generator v2.
+// Returns a BifrostImageGenerationResponse containing the generated images and any error that occurred.
 func (provider *BedrockProvider) ImageGeneration(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostImageGenerationRequest) (*schemas.BifrostImageGenerationResponse, *schemas.BifrostError) {
-	return nil, providerUtils.NewUnsupportedOperationError(schemas.ImageGenerationRequest, schemas.Bedrock)
+	if err := providerUtils.CheckOperationAllowed(schemas.Bedrock, provider.customProviderConfig, schemas.ImageGenerationRequest); err != nil {
+		return nil, err
+	}
+
+	providerName := provider.GetProviderKey()
+	if key.BedrockKeyConfig == nil {
+		return nil, providerUtils.NewConfigurationError("bedrock key config is not provided", providerName)
+	}
+
+	modelType := DetermineImageGenModelType(request.Model)
+	var rawResponse []byte
+	var jsonData []byte
+	var bifrostError *schemas.BifrostError
+	var latency time.Duration
+	var path string
+	var deployment string
+	switch modelType {
+
+	case "titan-image-generator-v1", "nova-canvas-v1:0", "titan-image-generator-v2:0":
+		jsonData, bifrostError = providerUtils.CheckContextAndGetRequestBody(
+			ctx,
+			request,
+			func() (any, error) { return ToBedrockImageGenerationRequest(request) },
+			provider.GetProviderKey())
+		if bifrostError != nil {
+			return nil, bifrostError
+		}
+		path, deployment = provider.getModelPath("invoke", request.Model, key)
+		rawResponse, latency, bifrostError = provider.completeRequest(ctx, jsonData, path, key)
+	default:
+		return nil, providerUtils.NewConfigurationError("unsupported image generation model type", providerName)
+	}
+	if bifrostError != nil {
+		return nil, providerUtils.EnrichError(ctx, bifrostError, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+	}
+
+	// Parse response based on model type
+	var bifrostResponse *schemas.BifrostImageGenerationResponse
+	switch modelType {
+	case "titan-image-generator-v1", "nova-canvas-v1:0", "titan-image-generator-v2:0":
+		var imageResp BedrockImageGenerationResponse
+		if err := sonic.Unmarshal(rawResponse, &imageResp); err != nil {
+			return nil, providerUtils.EnrichError(ctx, providerUtils.NewBifrostOperationError("error parsing image generation response", err, providerName), jsonData, rawResponse, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		}
+
+		if imageResp.Error != "" {
+			return nil, providerUtils.EnrichError(ctx, providerUtils.NewBifrostOperationError(imageResp.Error, nil, providerName), jsonData, rawResponse, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		}
+
+		bifrostResponse = ToBifrostImageGenerationResponse(&imageResp)
+		bifrostResponse.Model = request.Model
+		bifrostResponse.ExtraFields.RequestType = schemas.ImageGenerationRequest
+		bifrostResponse.ExtraFields.Provider = providerName
+		bifrostResponse.ExtraFields.ModelRequested = request.Model
+		bifrostResponse.ExtraFields.ModelDeployment = deployment
+		bifrostResponse.ExtraFields.Latency = latency.Milliseconds()
+
+		// Set raw request if enabled
+		if providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest) {
+			providerUtils.ParseAndSetRawRequest(&bifrostResponse.ExtraFields, jsonData)
+		}
+
+		if providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse) {
+			var rawResponseData interface{}
+			if err := sonic.Unmarshal(rawResponse, &rawResponseData); err == nil {
+				bifrostResponse.ExtraFields.RawResponse = rawResponseData
+			}
+		}
+
+		return bifrostResponse, nil
+	}
+	return nil, providerUtils.NewConfigurationError("unsupported image generation model type", providerName)
 }
 
 // ImageGenerationStream is not supported by the Bedrock provider.
@@ -2831,4 +3083,49 @@ func (provider *BedrockProvider) getModelPath(basePath string, model string, key
 
 func (provider *BedrockProvider) CountTokens(_ *schemas.BifrostContext, _ schemas.Key, _ *schemas.BifrostResponsesRequest) (*schemas.BifrostCountTokensResponse, *schemas.BifrostError) {
 	return nil, providerUtils.NewUnsupportedOperationError(schemas.CountTokensRequest, provider.GetProviderKey())
+}
+
+// ContainerCreate is not supported by the Bedrock provider.
+func (provider *BedrockProvider) ContainerCreate(_ *schemas.BifrostContext, _ schemas.Key, _ *schemas.BifrostContainerCreateRequest) (*schemas.BifrostContainerCreateResponse, *schemas.BifrostError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.ContainerCreateRequest, provider.GetProviderKey())
+}
+
+// ContainerList is not supported by the Bedrock provider.
+func (provider *BedrockProvider) ContainerList(_ *schemas.BifrostContext, _ []schemas.Key, _ *schemas.BifrostContainerListRequest) (*schemas.BifrostContainerListResponse, *schemas.BifrostError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.ContainerListRequest, provider.GetProviderKey())
+}
+
+// ContainerRetrieve is not supported by the Bedrock provider.
+func (provider *BedrockProvider) ContainerRetrieve(_ *schemas.BifrostContext, _ []schemas.Key, _ *schemas.BifrostContainerRetrieveRequest) (*schemas.BifrostContainerRetrieveResponse, *schemas.BifrostError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.ContainerRetrieveRequest, provider.GetProviderKey())
+}
+
+// ContainerDelete is not supported by the Bedrock provider.
+func (provider *BedrockProvider) ContainerDelete(_ *schemas.BifrostContext, _ []schemas.Key, _ *schemas.BifrostContainerDeleteRequest) (*schemas.BifrostContainerDeleteResponse, *schemas.BifrostError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.ContainerDeleteRequest, provider.GetProviderKey())
+}
+
+// ContainerFileCreate is not supported by the Bedrock provider.
+func (provider *BedrockProvider) ContainerFileCreate(_ *schemas.BifrostContext, _ schemas.Key, _ *schemas.BifrostContainerFileCreateRequest) (*schemas.BifrostContainerFileCreateResponse, *schemas.BifrostError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.ContainerFileCreateRequest, provider.GetProviderKey())
+}
+
+// ContainerFileList is not supported by the Bedrock provider.
+func (provider *BedrockProvider) ContainerFileList(_ *schemas.BifrostContext, _ []schemas.Key, _ *schemas.BifrostContainerFileListRequest) (*schemas.BifrostContainerFileListResponse, *schemas.BifrostError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.ContainerFileListRequest, provider.GetProviderKey())
+}
+
+// ContainerFileRetrieve is not supported by the Bedrock provider.
+func (provider *BedrockProvider) ContainerFileRetrieve(_ *schemas.BifrostContext, _ []schemas.Key, _ *schemas.BifrostContainerFileRetrieveRequest) (*schemas.BifrostContainerFileRetrieveResponse, *schemas.BifrostError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.ContainerFileRetrieveRequest, provider.GetProviderKey())
+}
+
+// ContainerFileContent is not supported by the Bedrock provider.
+func (provider *BedrockProvider) ContainerFileContent(_ *schemas.BifrostContext, _ []schemas.Key, _ *schemas.BifrostContainerFileContentRequest) (*schemas.BifrostContainerFileContentResponse, *schemas.BifrostError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.ContainerFileContentRequest, provider.GetProviderKey())
+}
+
+// ContainerFileDelete is not supported by the Bedrock provider.
+func (provider *BedrockProvider) ContainerFileDelete(_ *schemas.BifrostContext, _ []schemas.Key, _ *schemas.BifrostContainerFileDeleteRequest) (*schemas.BifrostContainerFileDeleteResponse, *schemas.BifrostError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.ContainerFileDeleteRequest, provider.GetProviderKey())
 }

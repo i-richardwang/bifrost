@@ -29,12 +29,12 @@ import { Clipboard, DollarSign, FileText, MoreVertical, Timer, Trash2 } from "lu
 import moment from "moment";
 import { toast } from "sonner";
 import { CodeEditor } from "./codeEditor";
+import ImageView from "./imageView";
 import LogChatMessageView from "./logChatMessageView";
 import LogEntryDetailsView from "./logEntryDetailsView";
 import LogResponsesMessageView from "./logResponsesMessageView";
 import SpeechView from "./speechView";
 import TranscriptionView from "./transcriptionView";
-import ImageView from "./imageView";
 
 interface LogDetailSheetProps {
 	log: LogEntry | null;
@@ -43,8 +43,20 @@ interface LogDetailSheetProps {
 	handleDelete: (log: LogEntry) => void;
 }
 
+// Helper to detect container operations (for hiding irrelevant fields like Model/Tokens)
+const isContainerOperation = (object: string) => {
+	const containerTypes = [
+		'container_create', 'container_list', 'container_retrieve', 'container_delete',
+		'container_file_create', 'container_file_list', 'container_file_retrieve',
+		'container_file_content', 'container_file_delete'
+	]
+	return containerTypes.includes(object?.toLowerCase())
+}
+
 export function LogDetailSheet({ log, open, onOpenChange, handleDelete }: LogDetailSheetProps) {
 	if (!log) return null;
+
+	const isContainer = isContainerOperation(log.object)
 
 	// Taking out tool call
 	let toolsParameter = null;
@@ -163,11 +175,14 @@ export function LogDetailSheet({ log, open, onOpenChange, handleDelete }: LogDet
 			}
 
 			const requestBodyJson = JSON.stringify(requestBody, null, 2);
-			navigator.clipboard.writeText(requestBodyJson).then(() => {
-				toast.success("Request body copied to clipboard");
-			}).catch((error) => {
-				toast.error("Failed to copy request body");
-			});
+			navigator.clipboard
+				.writeText(requestBodyJson)
+				.then(() => {
+					toast.success("Request body copied to clipboard");
+				})
+				.catch((error) => {
+					toast.error("Failed to copy request body");
+				});
 		} catch (error) {
 			toast.error("Failed to copy request body");
 		}
@@ -178,7 +193,7 @@ export function LogDetailSheet({ log, open, onOpenChange, handleDelete }: LogDet
 
 	return (
 		<Sheet open={open} onOpenChange={onOpenChange}>
-			<SheetContent className="dark:bg-card flex w-full flex-col gap-4 overflow-x-hidden bg-white p-8" expandable>
+			<SheetContent className="dark:bg-card flex w-full flex-col gap-4 overflow-x-hidden bg-white p-8">
 				<SheetHeader className="flex flex-row items-center px-0">
 					<div className="flex w-full items-center justify-between">
 						<SheetTitle className="flex w-fit items-center gap-2 font-medium">
@@ -228,7 +243,7 @@ export function LogDetailSheet({ log, open, onOpenChange, handleDelete }: LogDet
 						</AlertDialogContent>
 					</AlertDialog>
 				</SheetHeader>
-				<div className="space-y-4 rounded-sm border px-6 py-4">
+				<div className="space-y-4 rounded-sm border px-6 py-4 -mt-4">
 					<div className="space-y-4">
 						<BlockHeader title="Timings" icon={<Timer className="h-5 w-5 text-gray-600" />} />
 						<div className="grid w-full grid-cols-3 items-center justify-between gap-4">
@@ -265,7 +280,7 @@ export function LogDetailSheet({ log, open, onOpenChange, handleDelete }: LogDet
 									</Badge>
 								}
 							/>
-							<LogEntryDetailsView className="w-full" label="Model" value={log.model} />
+							{!isContainer && <LogEntryDetailsView className="w-full" label="Model" value={log.model} />}
 							<LogEntryDetailsView
 								className="w-full"
 								label="Type"
@@ -306,14 +321,14 @@ export function LogDetailSheet({ log, open, onOpenChange, handleDelete }: LogDet
 									.map(([key, value]) => <LogEntryDetailsView key={key} className="w-full" label={key} value={value} />)}
 						</div>
 					</div>
-					{log.status === "success" && (
+					{log.status === "success" && !isContainer && (
 						<>
 							<DottedSeparator />
 							<div className="space-y-4">
 								<BlockHeader title="Tokens" icon={<DollarSign className="h-5 w-5 text-gray-600" />} />
 								<div className="grid w-full grid-cols-3 items-center justify-between gap-4">
-									<LogEntryDetailsView className="w-full" label="Prompt Tokens" value={log.token_usage?.prompt_tokens || "-"} />
-									<LogEntryDetailsView className="w-full" label="Completion Tokens" value={log.token_usage?.completion_tokens || "-"} />
+									<LogEntryDetailsView className="w-full" label="Input Tokens" value={log.token_usage?.prompt_tokens || "-"} />
+									<LogEntryDetailsView className="w-full" label="Output Tokens" value={log.token_usage?.completion_tokens || "-"} />
 									<LogEntryDetailsView className="w-full" label="Total Tokens" value={log.token_usage?.total_tokens || "-"} />
 									{log.token_usage?.prompt_tokens_details && (
 										<>
@@ -539,10 +554,7 @@ export function LogDetailSheet({ log, open, onOpenChange, handleDelete }: LogDet
 				)}
 
 				{(log.image_generation_input || log.image_generation_output) && (
-					<ImageView
-						imageInput={log.image_generation_input}
-						imageOutput={log.image_generation_output}
-					/>
+					<ImageView imageInput={log.image_generation_input} imageOutput={log.image_generation_output} />
 				)}
 
 				{/* Show conversation history for chat/text completions */}
