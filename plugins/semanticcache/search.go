@@ -82,6 +82,31 @@ func (plugin *Plugin) performDirectSearch(ctx *schemas.BifrostContext, req *sche
 	return plugin.buildResponseFromResult(ctx, req, result, CacheTypeDirect, 1.0, 0)
 }
 
+// generateEmbeddingsForStorage generates embeddings and stores them in context for PostHook storage.
+// This is used when the vector store requires vectors but we're in direct-only cache mode.
+// Unlike performSemanticSearch, this function does not perform any search - it only generates
+// and stores embeddings so they can be persisted with the cache entry.
+func (plugin *Plugin) generateEmbeddingsForStorage(ctx *schemas.BifrostContext, req *schemas.BifrostRequest) error {
+	// Extract text and metadata for embedding
+	text, paramsHash, err := plugin.extractTextForEmbedding(req)
+	if err != nil {
+		return fmt.Errorf("failed to extract text for embedding: %w", err)
+	}
+
+	// Generate embedding
+	embedding, inputTokens, err := plugin.generateEmbedding(ctx, text)
+	if err != nil {
+		return fmt.Errorf("failed to generate embedding: %w", err)
+	}
+
+	// Store embedding and metadata in context for PostHook
+	ctx.SetValue(requestEmbeddingKey, embedding)
+	ctx.SetValue(requestEmbeddingTokensKey, inputTokens)
+	ctx.SetValue(requestParamsHashKey, paramsHash)
+
+	return nil
+}
+
 // performSemanticSearch performs semantic similarity search and returns matching response if found.
 func (plugin *Plugin) performSemanticSearch(ctx *schemas.BifrostContext, req *schemas.BifrostRequest, cacheKey string) (*schemas.PluginShortCircuit, error) {
 	// Extract text and metadata for embedding
@@ -198,7 +223,7 @@ func (plugin *Plugin) buildResponseFromResult(ctx *schemas.BifrostContext, req *
 					defer cancel()
 					err := plugin.store.Delete(deleteCtx, plugin.config.VectorStoreNamespace, result.ID)
 					if err != nil {
-						plugin.logger.Warn(fmt.Sprintf("%s Failed to delete expired entry %s: %v", PluginLoggerPrefix, result.ID, err))
+						plugin.logger.Warn("%s Failed to delete expired entry %s: %v", PluginLoggerPrefix, result.ID, err)
 					}
 				}()
 				// Return nil to indicate cache miss
@@ -299,7 +324,7 @@ func (plugin *Plugin) buildStreamingResponseFromResult(ctx *schemas.BifrostConte
 	ctx.SetValue(cacheHitTypeKey, cacheType)
 
 	// Create stream channel
-	streamChan := make(chan *schemas.BifrostStream)
+	streamChan := make(chan *schemas.BifrostStreamChunk)
 
 	go func() {
 		defer close(streamChan)
@@ -312,14 +337,14 @@ func (plugin *Plugin) buildStreamingResponseFromResult(ctx *schemas.BifrostConte
 		for i, chunkData := range streamArray {
 			chunkStr, ok := chunkData.(string)
 			if !ok {
-				plugin.logger.Warn(fmt.Sprintf("%s Stream chunk %d is not a string, skipping", PluginLoggerPrefix, i))
+				plugin.logger.Warn("%s Stream chunk %d is not a string, skipping", PluginLoggerPrefix, i)
 				continue
 			}
 
 			// Unmarshal the chunk as BifrostResponse
 			var cachedResponse schemas.BifrostResponse
 			if err := json.Unmarshal([]byte(chunkStr), &cachedResponse); err != nil {
-				plugin.logger.Warn(fmt.Sprintf("%s Failed to unmarshal stream chunk %d, skipping: %v", PluginLoggerPrefix, i, err))
+				plugin.logger.Warn("%s Failed to unmarshal stream chunk %d, skipping: %v", PluginLoggerPrefix, i, err)
 				continue
 			}
 
@@ -353,7 +378,7 @@ func (plugin *Plugin) buildStreamingResponseFromResult(ctx *schemas.BifrostConte
 			extraFields.Provider = provider
 
 			// Send chunk to stream
-			streamChan <- &schemas.BifrostStream{
+			streamChan <- &schemas.BifrostStreamChunk{
 				BifrostTextCompletionResponse:        cachedResponse.TextCompletionResponse,
 				BifrostChatResponse:                  cachedResponse.ChatResponse,
 				BifrostResponsesStreamResponse:       cachedResponse.ResponsesStreamResponse,

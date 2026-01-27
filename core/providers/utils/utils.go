@@ -167,7 +167,7 @@ func ConfigureProxy(client *fasthttp.Client, proxyConfig *schemas.ProxyConfig, l
 		// Use environment variables for proxy configuration
 		dialFunc = fasthttpproxy.FasthttpProxyHTTPDialer()
 	default:
-		logger.Warn(fmt.Sprintf("Invalid proxy configuration: unsupported proxy type: %s", proxyConfig.Type))
+		logger.Warn("Invalid proxy configuration: unsupported proxy type: %s", proxyConfig.Type)
 		return client
 	}
 
@@ -179,7 +179,7 @@ func ConfigureProxy(client *fasthttp.Client, proxyConfig *schemas.ProxyConfig, l
 	if proxyConfig.CACertPEM != "" {
 		tlsConfig, err := createTLSConfigWithCA(proxyConfig.CACertPEM)
 		if err != nil {
-			logger.Warn(fmt.Sprintf("Failed to configure custom CA certificate: %v", err))
+			logger.Warn("Failed to configure custom CA certificate: %v", err)
 		} else {
 			client.TLSConfig = tlsConfig
 		}
@@ -251,7 +251,6 @@ func SetExtraHeaders(ctx context.Context, req *fasthttp.Request, extraHeaders ma
 			req.Header.Set(canonicalKey, value)
 		}
 	}
-
 	// Give priority to extra headers in the context
 	if extraHeaders, ok := (ctx).Value(schemas.BifrostContextKeyExtraHeaders).(map[string][]string); ok {
 		for k, values := range filterHeaders(extraHeaders) {
@@ -481,7 +480,7 @@ func EnrichError(
 	if ShouldSendBackRawRequest(ctx, sendBackRawRequest) && len(requestBody) > 0 {
 		var rawRequest interface{}
 		if err := sonic.Unmarshal(requestBody, &rawRequest); err != nil {
-			logger.Warn(fmt.Sprintf("Failed to parse raw request for error: %v", err))
+			logger.Warn("Failed to parse raw request for error: %v", err)
 			return bifrostErr
 		}
 		bifrostErr.ExtraFields.RawRequest = rawRequest
@@ -494,7 +493,7 @@ func EnrichError(
 			// We have a responseBody to set
 			var rawResponse interface{}
 			if err := sonic.Unmarshal(responseBody, &rawResponse); err != nil {
-				logger.Warn(fmt.Sprintf("Failed to parse raw response for error: %v", err))
+				logger.Warn("Failed to parse raw response for error: %v", err)
 				return bifrostErr
 			}
 			bifrostErr.ExtraFields.RawResponse = rawResponse
@@ -623,7 +622,7 @@ func HandleProviderResponse[T any](responseBody []byte, response *T, requestBody
 func ParseAndSetRawRequest(extraFields *schemas.BifrostResponseExtraFields, jsonBody []byte) {
 	var rawRequest interface{}
 	if err := sonic.Unmarshal(jsonBody, &rawRequest); err != nil {
-		logger.Warn(fmt.Sprintf("Failed to parse raw request: %v", err))
+		logger.Warn("Failed to parse raw request: %v", err)
 	} else {
 		extraFields.RawRequest = rawRequest
 	}
@@ -917,7 +916,7 @@ func ShouldSendBackRawResponse(ctx context.Context, defaultSendBackRawResponse b
 }
 
 // SendCreatedEventResponsesChunk sends a ResponsesStreamResponseTypeCreated event.
-func SendCreatedEventResponsesChunk(ctx *schemas.BifrostContext, postHookRunner schemas.PostHookRunner, provider schemas.ModelProvider, model string, startTime time.Time, responseChan chan *schemas.BifrostStream) {
+func SendCreatedEventResponsesChunk(ctx *schemas.BifrostContext, postHookRunner schemas.PostHookRunner, provider schemas.ModelProvider, model string, startTime time.Time, responseChan chan *schemas.BifrostStreamChunk) {
 	firstChunk := &schemas.BifrostResponsesStreamResponse{
 		Type:           schemas.ResponsesStreamResponseTypeCreated,
 		SequenceNumber: 0,
@@ -938,7 +937,7 @@ func SendCreatedEventResponsesChunk(ctx *schemas.BifrostContext, postHookRunner 
 }
 
 // SendInProgressEventResponsesChunk sends a ResponsesStreamResponseTypeInProgress event
-func SendInProgressEventResponsesChunk(ctx *schemas.BifrostContext, postHookRunner schemas.PostHookRunner, provider schemas.ModelProvider, model string, startTime time.Time, responseChan chan *schemas.BifrostStream) {
+func SendInProgressEventResponsesChunk(ctx *schemas.BifrostContext, postHookRunner schemas.PostHookRunner, provider schemas.ModelProvider, model string, startTime time.Time, responseChan chan *schemas.BifrostStreamChunk) {
 	chunk := &schemas.BifrostResponsesStreamResponse{
 		Type:           schemas.ResponsesStreamResponseTypeInProgress,
 		SequenceNumber: 1,
@@ -967,7 +966,7 @@ func ProcessAndSendResponse(
 	ctx *schemas.BifrostContext,
 	postHookRunner schemas.PostHookRunner,
 	response *schemas.BifrostResponse,
-	responseChan chan *schemas.BifrostStream,
+	responseChan chan *schemas.BifrostStreamChunk,
 ) {
 	// Accumulate chunk for tracing (common for all providers)
 	if tracer, ok := ctx.Value(schemas.BifrostContextKeyTracer).(schemas.Tracer); ok && tracer != nil {
@@ -989,7 +988,7 @@ func ProcessAndSendResponse(
 		return
 	}
 
-	streamResponse := &schemas.BifrostStream{}
+	streamResponse := &schemas.BifrostStreamChunk{}
 	if processedResponse != nil {
 		streamResponse.BifrostTextCompletionResponse = processedResponse.TextCompletionResponse
 		streamResponse.BifrostChatResponse = processedResponse.ChatResponse
@@ -1025,7 +1024,7 @@ func ProcessAndSendBifrostError(
 	ctx *schemas.BifrostContext,
 	postHookRunner schemas.PostHookRunner,
 	bifrostErr *schemas.BifrostError,
-	responseChan chan *schemas.BifrostStream,
+	responseChan chan *schemas.BifrostStreamChunk,
 	logger schemas.Logger,
 ) {
 	// Run post hooks first so span reflects post-processed data
@@ -1041,7 +1040,7 @@ func ProcessAndSendBifrostError(
 		return
 	}
 
-	streamResponse := &schemas.BifrostStream{}
+	streamResponse := &schemas.BifrostStreamChunk{}
 	if processedResponse != nil {
 		streamResponse.BifrostTextCompletionResponse = processedResponse.TextCompletionResponse
 		streamResponse.BifrostChatResponse = processedResponse.ChatResponse
@@ -1102,7 +1101,7 @@ func SetupStreamCancellation(ctx context.Context, bodyStream io.Reader, logger s
 func HandleStreamCancellation(
 	ctx *schemas.BifrostContext,
 	postHookRunner schemas.PostHookRunner,
-	responseChan chan *schemas.BifrostStream,
+	responseChan chan *schemas.BifrostStreamChunk,
 	provider schemas.ModelProvider,
 	model string,
 	requestType schemas.RequestType,
@@ -1143,7 +1142,7 @@ func HandleStreamCancellation(
 func HandleStreamTimeout(
 	ctx *schemas.BifrostContext,
 	postHookRunner schemas.PostHookRunner,
-	responseChan chan *schemas.BifrostStream,
+	responseChan chan *schemas.BifrostStreamChunk,
 	provider schemas.ModelProvider,
 	model string,
 	requestType schemas.RequestType,
@@ -1181,7 +1180,7 @@ func ProcessAndSendError(
 	ctx *schemas.BifrostContext,
 	postHookRunner schemas.PostHookRunner,
 	err error,
-	responseChan chan *schemas.BifrostStream,
+	responseChan chan *schemas.BifrostStreamChunk,
 	requestType schemas.RequestType,
 	providerName schemas.ModelProvider,
 	model string,
@@ -1207,7 +1206,7 @@ func ProcessAndSendError(
 		return
 	}
 
-	streamResponse := &schemas.BifrostStream{}
+	streamResponse := &schemas.BifrostStreamChunk{}
 	if processedResponse != nil {
 		streamResponse.BifrostTextCompletionResponse = processedResponse.TextCompletionResponse
 		streamResponse.BifrostChatResponse = processedResponse.ChatResponse

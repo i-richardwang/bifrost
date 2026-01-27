@@ -43,6 +43,8 @@ type AnthropicResponsesStreamState struct {
 	CreatedAt                 int                               // Timestamp for created_at consistency
 	HasEmittedCreated         bool                              // Whether we've emitted response.created
 	HasEmittedInProgress      bool                              // Whether we've emitted response.in_progress
+	StructuredOutputToolName  string                            // Name of the structured output tool (if using tool-based SO for Vertex)
+	StructuredOutputIndex     *int                              // Output index of the structured output tool call
 }
 
 // anthropicResponsesStreamStatePool provides a pool for Anthropic responses stream state objects.
@@ -127,6 +129,8 @@ func acquireAnthropicResponsesStreamState() *AnthropicResponsesStreamState {
 	state.CreatedAt = int(time.Now().Unix())
 	state.HasEmittedCreated = false
 	state.HasEmittedInProgress = false
+	state.StructuredOutputToolName = ""
+	state.StructuredOutputIndex = nil
 	return state
 }
 
@@ -161,6 +165,8 @@ func (state *AnthropicResponsesStreamState) flush() {
 	state.CreatedAt = int(time.Now().Unix())
 	state.HasEmittedCreated = false
 	state.HasEmittedInProgress = false
+	state.StructuredOutputToolName = ""
+	state.StructuredOutputIndex = nil
 }
 
 // getOrCreateOutputIndex returns the output index for a given content index, creating a new one if needed
@@ -424,6 +430,27 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 
 				return responses, nil, false
 			case AnthropicContentBlockTypeToolUse:
+				// Check if this is the structured output tool - if so, skip emitting tool call
+				if state.StructuredOutputToolName != "" && chunk.ContentBlock.Name != nil && *chunk.ContentBlock.Name == state.StructuredOutputToolName {
+					// Mark this output index for structured output handling
+					state.StructuredOutputIndex = &outputIndex
+
+					// Initialize argument buffer for accumulating the JSON
+					state.ToolArgumentBuffers[outputIndex] = ""
+
+					// Mark tool use blocks to prevent synthetic content_part.added events
+					if chunk.Index != nil {
+						state.TextContentIndices[*chunk.Index] = false
+					}
+
+					// Store item ID for this structured output
+					if chunk.ContentBlock.ID != nil {
+						state.ItemIDs[outputIndex] = *chunk.ContentBlock.ID
+					}
+
+					return nil, nil, false
+				}
+
 				// Function call starting - emit output_item.added with type "function_call" and status "in_progress"
 				statusInProgress := "in_progress"
 				itemID := ""
@@ -608,6 +635,12 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 						state.ToolArgumentBuffers[outputIndex] = ""
 					}
 					state.ToolArgumentBuffers[outputIndex] += *chunk.Delta.PartialJSON
+
+					// Check if this is the structured output tool - if so, just accumulate without emitting
+					if state.StructuredOutputIndex != nil && *state.StructuredOutputIndex == outputIndex {
+						// This is the structured output tool - accumulate without emitting delta events
+						return nil, nil, false
+					}
 
 					// Emit appropriate delta type based on whether this is an MCP call
 					var deltaType schemas.ResponsesStreamResponseType
@@ -920,6 +953,61 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 					// Clear the reasoning content index tracking
 					delete(state.ReasoningContentIndices, *chunk.Index)
 				}
+			}
+
+			// Check if this is a structured output tool call
+			if accumulatedArgs, hasArgs := state.ToolArgumentBuffers[outputIndex]; hasArgs && state.StructuredOutputIndex != nil && *state.StructuredOutputIndex == outputIndex {
+				// This was a structured output tool - emit as text message instead
+				textContent := accumulatedArgs
+				if textContent == "" {
+					textContent = "{}"
+				}
+
+				// Create ContentBlocks with output_text type instead of ContentStr
+				contentBlock := schemas.ResponsesMessageContentBlock{
+					Type: schemas.ResponsesOutputMessageContentTypeText,
+					Text: &textContent,
+					ResponsesOutputMessageContentText: &schemas.ResponsesOutputMessageContentText{
+						Annotations: []schemas.ResponsesOutputMessageContentTextAnnotation{},
+						LogProbs:    []schemas.ResponsesOutputMessageContentTextLogProb{},
+					},
+				}
+
+				item := &schemas.ResponsesMessage{
+					Type:   schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+					Role:   schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+					Status: schemas.Ptr("completed"),
+					Content: &schemas.ResponsesMessageContent{
+						ContentBlocks: []schemas.ResponsesMessageContentBlock{contentBlock},
+					},
+				}
+				if itemID != "" {
+					item.ID = &itemID
+				}
+
+				// Emit output_item.added for the text message
+				responses = append(responses, &schemas.BifrostResponsesStreamResponse{
+					Type:           schemas.ResponsesStreamResponseTypeOutputItemAdded,
+					SequenceNumber: sequenceNumber + len(responses),
+					OutputIndex:    schemas.Ptr(outputIndex),
+					ContentIndex:   chunk.Index,
+					Item:           item,
+				})
+
+				// Emit output_item.done
+				responses = append(responses, &schemas.BifrostResponsesStreamResponse{
+					Type:           schemas.ResponsesStreamResponseTypeOutputItemDone,
+					SequenceNumber: sequenceNumber + len(responses),
+					OutputIndex:    schemas.Ptr(outputIndex),
+					ContentIndex:   chunk.Index,
+					Item:           item,
+				})
+
+				// Clear the buffer and tracking
+				delete(state.ToolArgumentBuffers, outputIndex)
+				state.StructuredOutputIndex = nil
+
+				return responses, nil, false
 			}
 
 			// Check if this is a tool call (function_call or MCP call)
@@ -1846,7 +1934,7 @@ func (request *AnthropicMessageRequest) ToBifrostResponsesRequest(ctx *schemas.B
 	var bifrostMessages []schemas.ResponsesMessage
 
 	// Convert regular messages using the new conversion method
-	convertedMessages := ConvertAnthropicMessagesToBifrostMessages(request.Messages, request.System, false, provider == schemas.Bedrock)
+	convertedMessages := ConvertAnthropicMessagesToBifrostMessages(ctx, request.Messages, request.System, false, provider == schemas.Bedrock)
 	bifrostMessages = append(bifrostMessages, convertedMessages...)
 
 	// Convert tools if present
@@ -1920,30 +2008,48 @@ func ToAnthropicResponsesRequest(ctx *schemas.BifrostContext, bifrostReq *schema
 			}
 		}
 		if bifrostReq.Params.Text != nil {
-			// Citations cannot be used together with Structured Outputs in anthropic.
-			hasCitationsEnabled := false
-			// loop over input messages and check if any message has citations enabled
-			for _, message := range bifrostReq.Input {
-				if message.Content == nil || message.Content.ContentBlocks == nil {
-					continue
-				}
-				if message.Content.ContentBlocks != nil {
-					for _, block := range message.Content.ContentBlocks {
-						if block.Type == schemas.ResponsesInputMessageContentBlockTypeFile &&
-							block.Citations != nil &&
-							block.Citations.Enabled != nil &&
-							*block.Citations.Enabled {
-							hasCitationsEnabled = true
-							break
+			// Vertex doesn't support native structured outputs, so convert to tool
+			if bifrostReq.Provider == schemas.Vertex {
+				if bifrostReq.Params.Text.Format != nil {
+					responseFormatTool := convertResponsesTextFormatToTool(ctx, bifrostReq.Params.Text)
+					if responseFormatTool != nil {
+						if anthropicReq.Tools == nil {
+							anthropicReq.Tools = []AnthropicTool{}
+						}
+						anthropicReq.Tools = append(anthropicReq.Tools, *responseFormatTool)
+						// Force the model to use this specific tool
+						anthropicReq.ToolChoice = &AnthropicToolChoice{
+							Type: "tool",
+							Name: responseFormatTool.Name,
 						}
 					}
 				}
-				if hasCitationsEnabled {
-					break
+			} else {
+				// Citations cannot be used together with Structured Outputs in anthropic.
+				hasCitationsEnabled := false
+				// loop over input messages and check if any message has citations enabled
+				for _, message := range bifrostReq.Input {
+					if message.Content == nil || message.Content.ContentBlocks == nil {
+						continue
+					}
+					if message.Content.ContentBlocks != nil {
+						for _, block := range message.Content.ContentBlocks {
+							if block.Type == schemas.ResponsesInputMessageContentBlockTypeFile &&
+								block.Citations != nil &&
+								block.Citations.Enabled != nil &&
+								*block.Citations.Enabled {
+								hasCitationsEnabled = true
+								break
+							}
+						}
+					}
+					if hasCitationsEnabled {
+						break
+					}
 				}
-			}
-			if !hasCitationsEnabled {
-				anthropicReq.OutputFormat = convertResponsesTextConfigToAnthropicOutputFormat(bifrostReq.Params.Text)
+				if !hasCitationsEnabled {
+					anthropicReq.OutputFormat = convertResponsesTextConfigToAnthropicOutputFormat(bifrostReq.Params.Text)
+				}
 			}
 		}
 		if bifrostReq.Params.Reasoning != nil {
@@ -2009,7 +2115,11 @@ func ToAnthropicResponsesRequest(ctx *schemas.BifrostContext, bifrostReq *schema
 				}
 			}
 			if len(anthropicTools) > 0 {
-				anthropicReq.Tools = anthropicTools
+				if anthropicReq.Tools == nil {
+					anthropicReq.Tools = anthropicTools
+				} else {
+					anthropicReq.Tools = append(anthropicReq.Tools, anthropicTools...)
+				}
 			}
 			if len(mcpServers) > 0 {
 				anthropicReq.MCPServers = mcpServers
@@ -2052,7 +2162,7 @@ func ToAnthropicResponsesRequest(ctx *schemas.BifrostContext, bifrostReq *schema
 }
 
 // ToBifrostResponsesResponse converts an Anthropic response to BifrostResponse with Responses structure
-func (response *AnthropicMessageResponse) ToBifrostResponsesResponse() *schemas.BifrostResponsesResponse {
+func (response *AnthropicMessageResponse) ToBifrostResponsesResponse(ctx *schemas.BifrostContext) *schemas.BifrostResponsesResponse {
 	if response == nil {
 		return nil
 	}
@@ -2097,7 +2207,7 @@ func (response *AnthropicMessageResponse) ToBifrostResponsesResponse() *schemas.
 				ContentBlocks: response.Content,
 			},
 		}
-		outputMessages := ConvertAnthropicMessagesToBifrostMessages([]AnthropicMessage{tempMsg}, nil, true, false)
+		outputMessages := ConvertAnthropicMessagesToBifrostMessages(ctx, []AnthropicMessage{tempMsg}, nil, true, false)
 		if len(outputMessages) > 0 {
 			bifrostResp.Output = outputMessages
 		}
@@ -2173,8 +2283,16 @@ func ToAnthropicResponsesResponse(ctx *schemas.BifrostContext, bifrostResp *sche
 }
 
 // ConvertAnthropicMessagesToBifrostMessages converts an array of Anthropic messages to Bifrost ResponsesMessage format
-func ConvertAnthropicMessagesToBifrostMessages(anthropicMessages []AnthropicMessage, systemContent *AnthropicContent, isOutputMessage bool, keepToolsGrouped bool) []schemas.ResponsesMessage {
+func ConvertAnthropicMessagesToBifrostMessages(ctx *schemas.BifrostContext, anthropicMessages []AnthropicMessage, systemContent *AnthropicContent, isOutputMessage bool, keepToolsGrouped bool) []schemas.ResponsesMessage {
 	var bifrostMessages []schemas.ResponsesMessage
+
+	// Get structured output tool name from context if present
+	var structuredOutputToolName string
+	if ctx != nil {
+		if toolName, ok := ctx.Value(schemas.BifrostContextKeyStructuredOutputToolName).(string); ok {
+			structuredOutputToolName = toolName
+		}
+	}
 
 	// Handle system message first if present
 	if systemContent != nil {
@@ -2186,9 +2304,9 @@ func ConvertAnthropicMessagesToBifrostMessages(anthropicMessages []AnthropicMess
 	for _, msg := range anthropicMessages {
 		var convertedMessages []schemas.ResponsesMessage
 		if keepToolsGrouped {
-			convertedMessages = convertSingleAnthropicMessageToBifrostMessagesGrouped(&msg, isOutputMessage)
+			convertedMessages = convertSingleAnthropicMessageToBifrostMessagesGrouped(&msg, isOutputMessage, structuredOutputToolName)
 		} else {
-			convertedMessages = convertSingleAnthropicMessageToBifrostMessages(&msg, isOutputMessage)
+			convertedMessages = convertSingleAnthropicMessageToBifrostMessages(ctx, &msg, isOutputMessage, structuredOutputToolName)
 		}
 		bifrostMessages = append(bifrostMessages, convertedMessages...)
 	}
@@ -2679,7 +2797,7 @@ func convertAnthropicSystemToBifrostMessages(systemContent *AnthropicContent) []
 }
 
 // Helper function to convert a single Anthropic message to Bifrost messages
-func convertSingleAnthropicMessageToBifrostMessages(msg *AnthropicMessage, isOutputMessage bool) []schemas.ResponsesMessage {
+func convertSingleAnthropicMessageToBifrostMessages(ctx *schemas.BifrostContext, msg *AnthropicMessage, isOutputMessage bool, structuredOutputToolName string) []schemas.ResponsesMessage {
 	// Determine if this message should use output types based on role
 	// Assistant messages in conversation history should use output_text
 	isOutput := isOutputMessage || msg.Role == AnthropicMessageRoleAssistant
@@ -2701,7 +2819,7 @@ func convertSingleAnthropicMessageToBifrostMessages(msg *AnthropicMessage, isOut
 	// Handle content blocks
 	if msg.Content.ContentBlocks != nil {
 		roleVal := schemas.ResponsesMessageRoleType(msg.Role)
-		return convertAnthropicContentBlocksToResponsesMessages(msg.Content.ContentBlocks, &roleVal, isOutput)
+		return convertAnthropicContentBlocksToResponsesMessages(ctx, msg.Content.ContentBlocks, &roleVal, isOutput, structuredOutputToolName)
 	}
 
 	return []schemas.ResponsesMessage{}
@@ -2709,7 +2827,7 @@ func convertSingleAnthropicMessageToBifrostMessages(msg *AnthropicMessage, isOut
 
 // Helper function to convert a single Anthropic message to Bifrost messages, grouping text and tool calls
 // This keeps assistant messages with mixed text and tool_use blocks together
-func convertSingleAnthropicMessageToBifrostMessagesGrouped(msg *AnthropicMessage, isOutputMessage bool) []schemas.ResponsesMessage {
+func convertSingleAnthropicMessageToBifrostMessagesGrouped(msg *AnthropicMessage, isOutputMessage bool, structuredOutputToolName string) []schemas.ResponsesMessage {
 	// Determine if this message should use output types based on role
 	// Assistant messages in conversation history should use output_text
 	isOutput := isOutputMessage || msg.Role == AnthropicMessageRoleAssistant
@@ -2895,6 +3013,12 @@ func convertAnthropicContentBlocksToResponsesMessagesGrouped(contentBlocks []Ant
 						}
 						bifrostMsg.ResponsesToolMessage.Output.ResponsesFunctionToolCallOutputBlocks = toolMsgContentBlocks
 					}
+
+					// Handle is_error from Anthropic
+					if block.IsError != nil && *block.IsError {
+						bifrostMsg.ResponsesToolMessage.Error = schemas.Ptr("Tool execution error")
+					}
+
 					bifrostMessages = append(bifrostMessages, bifrostMsg)
 				}
 			}
@@ -2991,7 +3115,7 @@ func convertAnthropicContentBlocksToResponsesMessagesGrouped(contentBlocks []Ant
 }
 
 // Helper function to convert Anthropic content blocks to Bifrost ResponsesMessages
-func convertAnthropicContentBlocksToResponsesMessages(contentBlocks []AnthropicContentBlock, role *schemas.ResponsesMessageRoleType, isOutputMessage bool) []schemas.ResponsesMessage {
+func convertAnthropicContentBlocksToResponsesMessages(ctx *schemas.BifrostContext, contentBlocks []AnthropicContentBlock, role *schemas.ResponsesMessageRoleType, isOutputMessage bool, structuredOutputToolName string) []schemas.ResponsesMessage {
 	var bifrostMessages []schemas.ResponsesMessage
 	var reasoningContentBlocks []schemas.ResponsesMessageContentBlock
 
@@ -3106,33 +3230,66 @@ func convertAnthropicContentBlocksToResponsesMessages(contentBlocks []AnthropicC
 				bifrostMessages = append(bifrostMessages, bifrostMsg)
 			}
 		case AnthropicContentBlockTypeToolUse:
-			// Convert tool use to function call message
-			if block.ID != nil && block.Name != nil {
+			// Check if this is the structured output tool - if so, convert to text content
+			if structuredOutputToolName != "" && block.Name != nil && *block.Name == structuredOutputToolName {
+				// This is a structured output tool - convert to text message
+				var jsonStr string
+				if block.Input != nil {
+					jsonStr = schemas.JsonifyInput(block.Input)
+				} else {
+					jsonStr = "{}"
+				}
+
+				contentBlock := schemas.ResponsesMessageContentBlock{
+					Type: schemas.ResponsesOutputMessageContentTypeText,
+					Text: &jsonStr,
+					ResponsesOutputMessageContentText: &schemas.ResponsesOutputMessageContentText{
+						LogProbs:    []schemas.ResponsesOutputMessageContentTextLogProb{},
+						Annotations: []schemas.ResponsesOutputMessageContentTextAnnotation{},
+					},
+				}
+
 				bifrostMsg := schemas.ResponsesMessage{
-					Type:   schemas.Ptr(schemas.ResponsesMessageTypeFunctionCall),
+					Type:   schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+					Role:   role,
 					Status: schemas.Ptr("completed"),
-					ResponsesToolMessage: &schemas.ResponsesToolMessage{
-						CallID: block.ID,
-						Name:   block.Name,
+					Content: &schemas.ResponsesMessageContent{
+						ContentBlocks: []schemas.ResponsesMessageContentBlock{contentBlock},
 					},
 				}
 				if isOutputMessage {
-					bifrostMsg.ID = schemas.Ptr("fc_" + providerUtils.GetRandomString(50))
-				}
-
-				// here need to check for computer tool use
-				if block.Name != nil && *block.Name == string(AnthropicToolNameComputer) {
-					bifrostMsg.Type = schemas.Ptr(schemas.ResponsesMessageTypeComputerCall)
-					bifrostMsg.ResponsesToolMessage.Name = nil
-					if inputMap, ok := block.Input.(map[string]interface{}); ok {
-						bifrostMsg.ResponsesToolMessage.Action = &schemas.ResponsesToolMessageActionStruct{
-							ResponsesComputerToolCallAction: convertAnthropicToResponsesComputerAction(inputMap),
-						}
-					}
-				} else {
-					bifrostMsg.ResponsesToolMessage.Arguments = schemas.Ptr(schemas.JsonifyInput(block.Input))
+					bifrostMsg.ID = schemas.Ptr("msg_" + providerUtils.GetRandomString(50))
 				}
 				bifrostMessages = append(bifrostMessages, bifrostMsg)
+			} else {
+				// Convert tool use to function call message
+				if block.ID != nil && block.Name != nil {
+					bifrostMsg := schemas.ResponsesMessage{
+						Type:   schemas.Ptr(schemas.ResponsesMessageTypeFunctionCall),
+						Status: schemas.Ptr("completed"),
+						ResponsesToolMessage: &schemas.ResponsesToolMessage{
+							CallID: block.ID,
+							Name:   block.Name,
+						},
+					}
+					if isOutputMessage {
+						bifrostMsg.ID = schemas.Ptr("fc_" + providerUtils.GetRandomString(50))
+					}
+
+					// here need to check for computer tool use
+					if block.Name != nil && *block.Name == string(AnthropicToolNameComputer) {
+						bifrostMsg.Type = schemas.Ptr(schemas.ResponsesMessageTypeComputerCall)
+						bifrostMsg.ResponsesToolMessage.Name = nil
+						if inputMap, ok := block.Input.(map[string]interface{}); ok {
+							bifrostMsg.ResponsesToolMessage.Action = &schemas.ResponsesToolMessageActionStruct{
+								ResponsesComputerToolCallAction: convertAnthropicToResponsesComputerAction(inputMap),
+							}
+						}
+					} else {
+						bifrostMsg.ResponsesToolMessage.Arguments = schemas.Ptr(schemas.JsonifyInput(block.Input))
+					}
+					bifrostMessages = append(bifrostMessages, bifrostMsg)
+				}
 			}
 		case AnthropicContentBlockTypeToolResult:
 			// Convert tool result to function call output message
@@ -3176,6 +3333,12 @@ func convertAnthropicContentBlocksToResponsesMessages(contentBlocks []AnthropicC
 						}
 						bifrostMsg.ResponsesToolMessage.Output.ResponsesFunctionToolCallOutputBlocks = toolMsgContentBlocks
 					}
+
+					// Handle is_error from Anthropic
+					if block.IsError != nil && *block.IsError {
+						bifrostMsg.ResponsesToolMessage.Error = schemas.Ptr("Tool execution error")
+					}
+
 					bifrostMessages = append(bifrostMessages, bifrostMsg)
 				}
 			}
@@ -3493,6 +3656,16 @@ func convertBifrostFunctionCallOutputToAnthropicToolResultBlock(msg *schemas.Res
 			toolResultBlock.Content = convertToolOutputToAnthropicContent(msg.ResponsesToolMessage.Output)
 		}
 
+		// Set is_error if there's an error message
+		if msg.ResponsesToolMessage.Error != nil && *msg.ResponsesToolMessage.Error != "" {
+			toolResultBlock.IsError = schemas.Ptr(true)
+			if toolResultBlock.Content == nil {
+				toolResultBlock.Content = &AnthropicContent{
+					ContentStr: msg.ResponsesToolMessage.Error,
+				}
+			}
+		}
+
 		return &toolResultBlock
 	}
 	return nil
@@ -3512,6 +3685,16 @@ func convertBifrostComputerCallOutputToAnthropicToolResultBlock(msg *schemas.Res
 			toolResultBlock.Content = convertToolOutputToAnthropicContent(msg.ResponsesToolMessage.Output)
 		}
 
+		// Set is_error if there's an error message
+		if msg.ResponsesToolMessage.Error != nil && *msg.ResponsesToolMessage.Error != "" {
+			toolResultBlock.IsError = schemas.Ptr(true)
+			if toolResultBlock.Content == nil {
+				toolResultBlock.Content = &AnthropicContent{
+					ContentStr: msg.ResponsesToolMessage.Error,
+				}
+			}
+		}
+
 		return &toolResultBlock
 	}
 	return nil
@@ -3529,6 +3712,16 @@ func convertBifrostMCPCallOutputToAnthropicToolResultBlock(msg *schemas.Response
 		// Handle output
 		if msg.ResponsesToolMessage.Output != nil {
 			toolResultBlock.Content = convertToolOutputToAnthropicContent(msg.ResponsesToolMessage.Output)
+		}
+
+		// Set is_error if there's an error message
+		if msg.ResponsesToolMessage.Error != nil && *msg.ResponsesToolMessage.Error != "" {
+			toolResultBlock.IsError = schemas.Ptr(true)
+			if toolResultBlock.Content == nil {
+				toolResultBlock.Content = &AnthropicContent{
+					ContentStr: msg.ResponsesToolMessage.Error,
+				}
+			}
 		}
 
 		return &toolResultBlock
@@ -3866,9 +4059,10 @@ func convertAnthropicToolToBifrost(tool *AnthropicTool) *schemas.ResponsesTool {
 		Description: tool.Description,
 	}
 
-	if tool.InputSchema != nil {
+	if tool.InputSchema != nil || tool.Strict != nil {
 		bifrostTool.ResponsesToolFunction = &schemas.ResponsesToolFunction{
 			Parameters: tool.InputSchema,
+			Strict:     tool.Strict,
 		}
 	}
 
@@ -4044,9 +4238,7 @@ func convertBifrostToolToAnthropic(model string, tool *schemas.ResponsesTool) *A
 		}
 	}
 
-	anthropicTool := &AnthropicTool{
-		Type: schemas.Ptr(AnthropicToolTypeCustom),
-	}
+	anthropicTool := &AnthropicTool{}
 
 	if tool.Name != nil {
 		anthropicTool.Name = *tool.Name
@@ -4056,9 +4248,10 @@ func convertBifrostToolToAnthropic(model string, tool *schemas.ResponsesTool) *A
 		anthropicTool.Description = tool.Description
 	}
 
-	// Convert parameters from ToolFunction
+	// Convert parameters and strict from ToolFunction
 	if tool.ResponsesToolFunction != nil {
 		anthropicTool.InputSchema = tool.ResponsesToolFunction.Parameters
+		anthropicTool.Strict = tool.ResponsesToolFunction.Strict
 	}
 
 	if tool.CacheControl != nil {

@@ -6,6 +6,8 @@ import (
 	"strings"
 
 	"github.com/bytedance/sonic"
+	"github.com/valyala/fasthttp"
+
 	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
 	"github.com/maximhq/bifrost/core/schemas"
 )
@@ -67,19 +69,416 @@ func getRequestBodyForResponses(ctx *schemas.BifrostContext, request *schemas.Bi
 		if reqBody == nil {
 			return nil, providerUtils.NewBifrostOperationError("request body is not provided", nil, providerName)
 		}
-
+		addMissingBetaHeadersToContext(ctx, reqBody)
 		if isStreaming {
 			reqBody.Stream = schemas.Ptr(true)
 		}
-
 		// Convert struct to map
 		jsonBody, err = sonic.Marshal(reqBody)
 		if err != nil {
 			return nil, providerUtils.NewBifrostOperationError(schemas.ErrProviderRequestMarshal, fmt.Errorf("failed to marshal request body: %w", err), providerName)
 		}
 	}
-
 	return jsonBody, nil
+}
+
+// addMissingBetaHeadersToContext analyzes the Anthropic request and adds missing beta headers to the context
+func addMissingBetaHeadersToContext(ctx *schemas.BifrostContext, req *AnthropicMessageRequest) error {
+	headers := []string{}
+	if req.Tools != nil {
+		for _, tool := range req.Tools {
+			// Check for strict (structured-outputs)
+			if tool.Strict != nil && *tool.Strict {
+				headers = appendUniqueHeader(headers, AnthropicStructuredOutputsBetaHeader)
+			}
+			// Check for advanced-tool-use features
+			if tool.DeferLoading != nil && *tool.DeferLoading {
+				headers = appendUniqueHeader(headers, AnthropicAdvancedToolUseBetaHeader)
+			}
+			if len(tool.InputExamples) > 0 {
+				headers = appendUniqueHeader(headers, AnthropicAdvancedToolUseBetaHeader)
+			}
+			if len(tool.AllowedCallers) > 0 {
+				headers = appendUniqueHeader(headers, AnthropicAdvancedToolUseBetaHeader)
+			}
+		}
+	}
+	// Check for MCP servers
+	if len(req.MCPServers) > 0 {
+		headers = appendUniqueHeader(headers, AnthropicMCPClientBetaHeader)
+	}
+	// Check for output format (structured outputs)
+	if req.OutputFormat != nil {
+		headers = appendUniqueHeader(headers, AnthropicStructuredOutputsBetaHeader)
+	}
+	if len(headers) == 0 {
+		return nil
+	}
+	var extraHeaders map[string][]string
+	if ctx.Value(schemas.BifrostContextKeyExtraHeaders) == nil {
+		extraHeaders = map[string][]string{}
+	} else {
+		if ctxExtraHeaders, ok := ctx.Value(schemas.BifrostContextKeyExtraHeaders).(map[string][]string); ok {
+			extraHeaders = ctxExtraHeaders
+		}
+	}
+	if len(extraHeaders["anthropic-beta"]) == 0 {
+		extraHeaders["anthropic-beta"] = headers
+	} else {
+		extraHeaders["anthropic-beta"] = append(extraHeaders["anthropic-beta"], headers...)
+	}
+	ctx.SetValue(schemas.BifrostContextKeyExtraHeaders, extraHeaders)
+	return nil
+}
+
+// appendUniqueHeader adds a header to the slice if not already present
+func appendUniqueHeader(slice []string, item string) []string {
+	for _, s := range slice {
+		if s == item {
+			return slice
+		}
+	}
+	return append(slice, item)
+}
+
+// appendBetaHeader appends a beta header to the request, preserving any existing beta headers
+func appendBetaHeader(req *fasthttp.Request, betaHeader string) {
+	existing := string(req.Header.Peek("anthropic-beta"))
+	if existing == "" {
+		req.Header.Set("anthropic-beta", betaHeader)
+		return
+	}
+	// Check if header already present
+	for _, h := range strings.Split(existing, ",") {
+		if strings.TrimSpace(h) == betaHeader {
+			return
+		}
+	}
+	req.Header.Set("anthropic-beta", existing+","+betaHeader)
+}
+
+// convertChatResponseFormatToTool converts a response_format config to an Anthropic tool for structured output
+// This is used when the provider is Vertex, which doesn't support native structured outputs
+func convertChatResponseFormatToTool(ctx *schemas.BifrostContext, params *schemas.ChatParameters) *AnthropicTool {
+	if params == nil || params.ResponseFormat == nil {
+		return nil
+	}
+
+	// ResponseFormat is stored as interface{}, need to parse it
+	responseFormatMap, ok := (*params.ResponseFormat).(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	// Check if type is "json_schema"
+	formatType, ok := responseFormatMap["type"].(string)
+	if !ok || formatType != "json_schema" {
+		return nil
+	}
+
+	// Extract json_schema object
+	jsonSchemaObj, ok := responseFormatMap["json_schema"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	// Extract name and schema
+	toolName, ok := jsonSchemaObj["name"].(string)
+	if !ok || toolName == "" {
+		toolName = "json_response"
+	}
+
+	schemaObj, ok := jsonSchemaObj["schema"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	// Extract description from schema if available
+	description := "Returns structured JSON output"
+	if desc, ok := schemaObj["description"].(string); ok && desc != "" {
+		description = desc
+	}
+
+	// Set bifrost context key structured output tool name
+	toolName = fmt.Sprintf("bf_so_%s", toolName)
+	ctx.SetValue(schemas.BifrostContextKeyStructuredOutputToolName, toolName)
+
+	// Create the Anthropic tool
+	normalizedSchema := normalizeSchemaForAnthropic(schemaObj)
+	schemaParams := convertMapToToolFunctionParameters(normalizedSchema)
+
+	return &AnthropicTool{
+		Name:        toolName,
+		Description: schemas.Ptr(description),
+		InputSchema: schemaParams,
+	}
+}
+
+// convertResponsesTextFormatToTool converts a text config to an Anthropic tool for structured output
+// This is used when the provider is Vertex, which doesn't support native structured outputs
+func convertResponsesTextFormatToTool(ctx *schemas.BifrostContext, textConfig *schemas.ResponsesTextConfig) *AnthropicTool {
+	if textConfig == nil || textConfig.Format == nil {
+		return nil
+	}
+
+	format := textConfig.Format
+	if format.Type != "json_schema" {
+		return nil
+	}
+
+	toolName := "json_response"
+	if format.Name != nil && strings.TrimSpace(*format.Name) != "" {
+		toolName = strings.TrimSpace(*format.Name)
+	}
+
+	description := "Returns structured JSON output"
+	if format.JSONSchema != nil && format.JSONSchema.Description != nil {
+		description = *format.JSONSchema.Description
+	}
+
+	toolName = fmt.Sprintf("bf_so_%s", toolName)
+	ctx.SetValue(schemas.BifrostContextKeyStructuredOutputToolName, toolName)
+
+	var schemaParams *schemas.ToolFunctionParameters
+	if format.JSONSchema != nil {
+		schemaParams = convertJSONSchemaToToolParameters(format.JSONSchema)
+	} else {
+		return nil // Schema is required for tooling
+	}
+
+	return &AnthropicTool{
+		Name:        toolName,
+		Description: schemas.Ptr(description),
+		InputSchema: schemaParams,
+	}
+}
+
+// convertJSONSchemaToToolParameters directly converts ResponsesTextConfigFormatJSONSchema to ToolFunctionParameters
+func convertJSONSchemaToToolParameters(schema *schemas.ResponsesTextConfigFormatJSONSchema) *schemas.ToolFunctionParameters {
+	if schema == nil {
+		return nil
+	}
+
+	// Default type to "object" if not specified
+	schemaType := "object"
+	if schema.Type != nil {
+		schemaType = *schema.Type
+	}
+
+	params := &schemas.ToolFunctionParameters{
+		Type:                 schemaType,
+		Description:          schema.Description,
+		Required:             schema.Required,
+		Enum:                 schema.Enum,
+		Ref:                  schema.Ref,
+		MinItems:             schema.MinItems,
+		MaxItems:             schema.MaxItems,
+		Format:               schema.Format,
+		Pattern:              schema.Pattern,
+		MinLength:            schema.MinLength,
+		MaxLength:            schema.MaxLength,
+		Minimum:              schema.Minimum,
+		Maximum:              schema.Maximum,
+		Title:                schema.Title,
+		Default:              schema.Default,
+		Nullable:             schema.Nullable,
+		AdditionalProperties: schema.AdditionalProperties,
+	}
+
+	// Convert map[string]any to OrderedMap for Properties
+	if schema.Properties != nil {
+		if orderedMap, ok := schemas.SafeExtractOrderedMap(*schema.Properties); ok {
+			params.Properties = &orderedMap
+		}
+	}
+
+	// Convert map[string]any to OrderedMap for Defs
+	if schema.Defs != nil {
+		if orderedMap, ok := schemas.SafeExtractOrderedMap(*schema.Defs); ok {
+			params.Defs = &orderedMap
+		}
+	}
+
+	// Convert map[string]any to OrderedMap for Definitions
+	if schema.Definitions != nil {
+		if orderedMap, ok := schemas.SafeExtractOrderedMap(*schema.Definitions); ok {
+			params.Definitions = &orderedMap
+		}
+	}
+
+	// Convert map[string]any to OrderedMap for Items
+	if schema.Items != nil {
+		if orderedMap, ok := schemas.SafeExtractOrderedMap(*schema.Items); ok {
+			params.Items = &orderedMap
+		}
+	}
+
+	// Convert []map[string]any to []OrderedMap for composition fields
+	if len(schema.AnyOf) > 0 {
+		params.AnyOf = make([]schemas.OrderedMap, 0, len(schema.AnyOf))
+		for _, item := range schema.AnyOf {
+			if orderedMap, ok := schemas.SafeExtractOrderedMap(item); ok {
+				params.AnyOf = append(params.AnyOf, orderedMap)
+			}
+		}
+	}
+
+	if len(schema.OneOf) > 0 {
+		params.OneOf = make([]schemas.OrderedMap, 0, len(schema.OneOf))
+		for _, item := range schema.OneOf {
+			if orderedMap, ok := schemas.SafeExtractOrderedMap(item); ok {
+				params.OneOf = append(params.OneOf, orderedMap)
+			}
+		}
+	}
+
+	if len(schema.AllOf) > 0 {
+		params.AllOf = make([]schemas.OrderedMap, 0, len(schema.AllOf))
+		for _, item := range schema.AllOf {
+			if orderedMap, ok := schemas.SafeExtractOrderedMap(item); ok {
+				params.AllOf = append(params.AllOf, orderedMap)
+			}
+		}
+	}
+
+	return params
+}
+
+// convertMapToToolFunctionParameters converts a map to ToolFunctionParameters
+func convertMapToToolFunctionParameters(m map[string]interface{}) *schemas.ToolFunctionParameters {
+	params := &schemas.ToolFunctionParameters{}
+
+	if typeVal, ok := m["type"].(string); ok {
+		params.Type = typeVal
+	}
+	if desc, ok := m["description"].(string); ok {
+		params.Description = &desc
+	}
+	if props, ok := schemas.SafeExtractOrderedMap(m["properties"]); ok {
+		params.Properties = &props
+	}
+	if req, ok := m["required"].([]interface{}); ok {
+		required := make([]string, 0, len(req))
+		for _, r := range req {
+			if str, ok := r.(string); ok {
+				required = append(required, str)
+			}
+		}
+		params.Required = required
+	}
+	if addProps, ok := m["additionalProperties"]; ok {
+		if addPropsBool, ok := addProps.(bool); ok {
+			params.AdditionalProperties = &schemas.AdditionalPropertiesStruct{
+				AdditionalPropertiesBool: &addPropsBool,
+			}
+		} else if addPropsMap, ok := schemas.SafeExtractOrderedMap(addProps); ok {
+			params.AdditionalProperties = &schemas.AdditionalPropertiesStruct{
+				AdditionalPropertiesMap: &addPropsMap,
+			}
+		}
+	}
+	if defs, ok := schemas.SafeExtractOrderedMap(m["$defs"]); ok {
+		params.Defs = &defs
+	}
+	if definitions, ok := schemas.SafeExtractOrderedMap(m["definitions"]); ok {
+		params.Definitions = &definitions
+	}
+	if ref, ok := m["$ref"].(string); ok {
+		params.Ref = &ref
+	}
+	if items, ok := schemas.SafeExtractOrderedMap(m["items"]); ok {
+		params.Items = &items
+	}
+	if minItems, ok := anthropicExtractInt64(m["minItems"]); ok {
+		params.MinItems = schemas.Ptr(minItems)
+	}
+	if maxItems, ok := anthropicExtractInt64(m["maxItems"]); ok {
+		params.MaxItems = schemas.Ptr(maxItems)
+	}
+	if anyOf, ok := m["anyOf"].([]interface{}); ok {
+		anyOfMaps := make([]schemas.OrderedMap, 0, len(anyOf))
+		for _, item := range anyOf {
+			if orderedMap, ok := schemas.SafeExtractOrderedMap(item); ok {
+				anyOfMaps = append(anyOfMaps, orderedMap)
+			}
+		}
+		if len(anyOfMaps) > 0 {
+			params.AnyOf = anyOfMaps
+		}
+	}
+	if oneOf, ok := m["oneOf"].([]interface{}); ok {
+		oneOfMaps := make([]schemas.OrderedMap, 0, len(oneOf))
+		for _, item := range oneOf {
+			if orderedMap, ok := schemas.SafeExtractOrderedMap(item); ok {
+				oneOfMaps = append(oneOfMaps, orderedMap)
+			}
+		}
+		if len(oneOfMaps) > 0 {
+			params.OneOf = oneOfMaps
+		}
+	}
+	if allOf, ok := m["allOf"].([]interface{}); ok {
+		allOfMaps := make([]schemas.OrderedMap, 0, len(allOf))
+		for _, item := range allOf {
+			if orderedMap, ok := schemas.SafeExtractOrderedMap(item); ok {
+				allOfMaps = append(allOfMaps, orderedMap)
+			}
+		}
+		if len(allOfMaps) > 0 {
+			params.AllOf = allOfMaps
+		}
+	}
+	if format, ok := m["format"].(string); ok {
+		params.Format = &format
+	}
+	if pattern, ok := m["pattern"].(string); ok {
+		params.Pattern = &pattern
+	}
+	if minLength, ok := anthropicExtractInt64(m["minLength"]); ok {
+		params.MinLength = schemas.Ptr(minLength)
+	}
+	if maxLength, ok := anthropicExtractInt64(m["maxLength"]); ok {
+		params.MaxLength = schemas.Ptr(maxLength)
+	}
+	if minimum, ok := anthropicExtractFloat64(m["minimum"]); ok {
+		params.Minimum = &minimum
+	}
+	if maximum, ok := anthropicExtractFloat64(m["maximum"]); ok {
+		params.Maximum = &maximum
+	}
+	if title, ok := m["title"].(string); ok {
+		params.Title = &title
+	}
+	if enumVal, ok := m["enum"]; ok {
+		switch e := enumVal.(type) {
+		case []interface{}:
+			enumStrs := make([]string, 0, len(e))
+			for _, v := range e {
+				if s, ok := v.(string); ok {
+					enumStrs = append(enumStrs, s)
+				}
+			}
+			if len(enumStrs) > 0 {
+				params.Enum = enumStrs
+			}
+		case []string:
+			if len(e) > 0 {
+				params.Enum = e
+			}
+		}
+	}
+	if def, ok := m["default"]; ok {
+		params.Default = def
+	}
+	if nullable, ok := m["nullable"].(bool); ok {
+		params.Nullable = &nullable
+	}
+
+	if params.Type == "" {
+		params.Type = "object"
+	}
+
+	return params
 }
 
 // ConvertAnthropicFinishReasonToBifrost converts provider finish reasons to Bifrost format

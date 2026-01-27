@@ -1,1 +1,0 @@
-- fix: allow flat $defs and propertyOrdering in jsonschema and forward it to Gemini
